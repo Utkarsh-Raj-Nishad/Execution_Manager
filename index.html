@@ -37,25 +37,15 @@
         </div>
       </div>
       <div class="top-actions">
-        <button class="btn ghost" data-act="open-assistant">✦ Tell the Assistant</button>
-        <button class="btn ghost" data-act="whatnow">⚡ What Now?</button>
+        <button class="btn ghost" data-act="whatnow">⚡ What Should I Do Now?</button>
         <button class="btn primary" data-act="open-exec">▶ Execution Mode</button>
       </div>
     </header>
-
-    <!-- Schedule update banner (auto-shows on reschedule) -->
-    <div class="sched-banner" id="schedBanner">
-      <span class="sb-icon">⟳</span>
-      <div class="sb-text"><b id="schedBannerTitle">Schedule Updated</b><span id="schedBannerMsg"></span></div>
-      <button class="btn sm" data-act="view-diff">View Changes</button>
-      <button class="btn ghost sm" data-act="dismiss-banner">✕</button>
-    </div>
-
     <section class="view" id="view"></section>
   </main>
 </div>
 
-<!-- SIDE DRAWER -->
+<!-- SIDE DRAWER (Calendar day detail) -->
 <div class="drawer-backdrop" id="drawerBackdrop"></div>
 <aside class="drawer" id="drawer">
   <div class="drawer-head">
@@ -69,7 +59,9 @@
 </aside>
 
 <!-- MODAL -->
-<div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
+<div class="overlay" id="overlay">
+  <div class="modal" id="modal"></div>
+</div>
 
 <!-- EXECUTION MODE -->
 <div class="exec" id="exec">
@@ -86,9 +78,6 @@
     <button class="btn ghost" data-act="close-exec">Exit</button>
   </div>
 </div>
-
-<!-- PRACTICE SESSION (full screen) -->
-<div class="practice-session" id="practiceSession"></div>
 
 <div class="toast-wrap" id="toasts"></div>
 
