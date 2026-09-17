@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CHIEF'S EXECUTION ASSISTANT</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">◈</div>
+      <div>
+        <div class="brand-title">CHIEF'S</div>
+        <div class="brand-sub">EXECUTION ASSISTANT</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot">
+      <div class="pill" id="examPill"><span class="dot"></span><span id="examPillText">EXAM MODE · OFF</span></div>
+      <div class="pill" id="focusPill"><span class="dot"></span><span id="focusPillText">NO ACTIVE SESSION</span></div>
+      <div class="pill" id="filePill" title="Data file auto-save"><span class="dot"></span><span id="filePillText">DATA FILE · LOCAL ONLY</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="flex center gap12">
+        <button class="menu-btn" id="menuBtn">☰</button>
+        <div class="clock">
+          <div>
+            <div class="clock-date" id="topDate">—</div>
+            <div class="clock-time" id="topTime">--:--<span class="sec">:--</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="btn ghost" data-act="whatnow">⚡ What Should I Do Now?</button>
+        <button class="btn primary" data-act="open-exec">▶ Execution Mode</button>
+      </div>
+    </header>
+    <section class="view" id="view"></section>
+  </main>
+</div>
+
+<!-- SIDE DRAWER (Calendar day detail) -->
+<div class="drawer-backdrop" id="drawerBackdrop"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div style="flex:1;min-width:0;">
+      <div class="small muted" id="drawerDateLbl" style="letter-spacing:.14em;text-transform:uppercase;">—</div>
+      <div class="drawer-title" id="drawerTitle">Day Detail</div>
+    </div>
+    <button class="btn ghost sm" data-act="close-drawer">✕</button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<!-- MODAL -->
+<div class="overlay" id="overlay">
+  <div class="modal" id="modal"></div>
+</div>
+
+<!-- EXECUTION MODE -->
+<div class="exec" id="exec">
+  <div class="exec-tag" id="execTag">EXECUTION MODE</div>
+  <div class="exec-task" id="execTask">No task selected</div>
+  <div class="exec-obj" id="execObj">Select a task or chapter to begin.</div>
+  <div class="exec-timer" id="execTimer">00:00</div>
+  <div class="exec-bar"><i id="execBar" style="width:0%"></i></div>
+  <div class="exec-actions">
+    <button class="btn primary" data-act="timer-start">▶ Start</button>
+    <button class="btn" data-act="timer-pause">⏸ Pause</button>
+    <button class="btn" data-act="timer-launch">⚡ 5-Min Launch</button>
+    <button class="btn" data-act="timer-complete">✓ Complete</button>
+    <button class="btn ghost" data-act="close-exec">Exit</button>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
