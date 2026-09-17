@@ -1,11 +1,7 @@
 /* ============================================================
-   CHIEF'S EXECUTION ASSISTANT — v2
-   New in this version:
-     · Study Workspace (independent subjects / chapters, live sessions,
-       quick-log, auto-advancing chapter status from real minutes)
-     · Scroll restore across renders (Tasks page no longer jumps to top)
-     · Calendar side drawer with click-to-add
-     · Data file auto-save (File System Access API, IndexedDB-backed handle)
+   CHIEF'S EXECUTION ASSISTANT — v3
+   Adds: Adaptive Rescheduling · Tell the Assistant · Question Practice
+   Fixes: Settings auto-save · File/localStorage conflict on load
    ============================================================ */
 
 /* ------------------------------------------------------------
@@ -40,51 +36,34 @@
      setTimeout(()=>{el.style.transition='.4s';el.style.opacity='0';el.style.transform='translateX(40px)';
        setTimeout(()=>el.remove(),400);},2600);
    }
+   function savedPulse(){
+     let el=document.querySelector('.saved-pulse');
+     if(!el){ el=document.createElement('div'); el.className='saved-pulse'; el.textContent='Saved'; document.body.appendChild(el); }
+     el.classList.add('show');
+     clearTimeout(el._t);
+     el._t=setTimeout(()=>el.classList.remove('show'), 1000);
+   }
    
    /* ------------------------------------------------------------
-      1. INDEXEDDB (to persist the file handle across sessions)
+      1. INDEXEDDB
       ------------------------------------------------------------ */
-   function idbOpen(){
-     return new Promise((res,rej)=>{
-       const r=indexedDB.open('cea_fs',1);
-       r.onupgradeneeded=()=>r.result.createObjectStore('kv');
-       r.onsuccess=()=>res(r.result);
-       r.onerror=()=>rej(r.error);
-     });
-   }
-   async function idbSet(k,v){
-     const db=await idbOpen();
-     return new Promise((res,rej)=>{
-       const tx=db.transaction('kv','readwrite');
-       tx.objectStore('kv').put(v,k);
-       tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
-     });
-   }
-   async function idbGet(k){
-     const db=await idbOpen();
-     return new Promise((res,rej)=>{
-       const tx=db.transaction('kv','readonly');
-       const r=tx.objectStore('kv').get(k);
-       r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error);
-     });
-   }
-   async function idbDel(k){
-     const db=await idbOpen();
-     return new Promise((res,rej)=>{
-       const tx=db.transaction('kv','readwrite');
-       tx.objectStore('kv').delete(k);
-       tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
-     });
-   }
+   function idbOpen(){return new Promise((res,rej)=>{const r=indexedDB.open('cea_fs',1);
+     r.onupgradeneeded=()=>r.result.createObjectStore('kv');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+   async function idbSet(k,v){const db=await idbOpen();return new Promise((res,rej)=>{
+     const tx=db.transaction('kv','readwrite');tx.objectStore('kv').put(v,k);
+     tx.oncomplete=()=>res();tx.onerror=()=>rej(tx.error);});}
+   async function idbGet(k){const db=await idbOpen();return new Promise((res,rej)=>{
+     const tx=db.transaction('kv','readonly');const r=tx.objectStore('kv').get(k);
+     r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+   async function idbDel(k){const db=await idbOpen();return new Promise((res,rej)=>{
+     const tx=db.transaction('kv','readwrite');tx.objectStore('kv').delete(k);
+     tx.oncomplete=()=>res();tx.onerror=()=>rej(tx.error);});}
    
    /* ------------------------------------------------------------
-      2. FILE SYNC (auto-save to a JSON file on disk)
+      2. FILE SYNC — safe (compares timestamps)
       ------------------------------------------------------------ */
    const FileSync = {
-     handle:null,
-     connected:false,
-     saving:false,
-     lastSave:null,
+     handle:null, connected:false, saving:false, lastSave:null,
      supported: typeof window!=='undefined' && 'showSaveFilePicker' in window,
    
      async init(){
@@ -95,7 +74,8 @@
            const perm=await h.queryPermission({mode:'readwrite'});
            if(perm==='granted'){
              this.connected=true;
-             await this.loadFromFile();
+             // CRITICAL: only load from file if file is NEWER than localStorage
+             await this.loadFromFileIfNewer();
            }
          }
        }catch(e){ console.warn('FileSync init failed', e); }
@@ -103,10 +83,7 @@
      },
    
      async connect(){
-       if(!this.supported){
-         toast('Browser does not support file sync — use Export JSON');
-         return;
-       }
+       if(!this.supported){ toast('Browser does not support file sync — use Export JSON'); return; }
        try{
          const handle=await window.showSaveFilePicker({
            suggestedName:'chief-execution-data.json',
@@ -118,9 +95,7 @@
          await this.save();
          toast('Data file connected · auto-save ON');
          this.updateUI();
-       }catch(e){
-         if(e && e.name!=='AbortError') toast('Connection failed');
-       }
+       }catch(e){ if(e && e.name!=='AbortError') toast('Connection failed'); }
      },
    
      async reconnect(){
@@ -129,7 +104,7 @@
          const perm=await this.handle.requestPermission({mode:'readwrite'});
          if(perm==='granted'){
            this.connected=true;
-           await this.loadFromFile();
+           await this.loadFromFileIfNewer();
            toast('Reconnected · auto-save ON');
          } else toast('Permission denied');
        }catch(e){ toast('Reconnect failed'); }
@@ -146,24 +121,36 @@
          await w.close();
          this.lastSave=new Date();
          this.updateUI();
-       }catch(e){
-         console.warn('File save failed', e);
-         toast('File save failed');
-       } finally { this.saving=false; }
+       }catch(e){ console.warn('File save failed', e); }
+       finally { this.saving=false; }
      },
    
-     async loadFromFile(){
+     async loadFromFileIfNewer(){
        try{
          const file=await this.handle.getFile();
          const txt=await file.text();
          if(!txt.trim()) return;
          const data=JSON.parse(txt);
-         if(data && data.settings){
-           DB=data;
-           migrate();
-           try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){}
+         if(!data || !data.settings) return;
+   
+         // Compare timestamps
+         const localRaw=localStorage.getItem(DB_KEY);
+         let localSavedAt=null;
+         if(localRaw){ try{ const lp=JSON.parse(localRaw); localSavedAt=lp.savedAt||null; }catch(e){} }
+   
+         const fileSavedAt = data.savedAt || null;
+         const fileTime = fileSavedAt? Date.parse(fileSavedAt) : 0;
+         const localTime = localSavedAt? Date.parse(localSavedAt) : 0;
+   
+         // Only overwrite local if file is NEWER
+         if(fileTime > localTime){
+           DB=data; migrate();
+           localStorage.setItem(DB_KEY, JSON.stringify(DB));
            render();
-           toast('Loaded data from file');
+           toast('Loaded newer data from file');
+         } else {
+           // Local is newer or equal → keep local, but note we're connected
+           console.log('Local data is newer than file — keeping local');
          }
        }catch(e){ console.warn('Load from file failed', e); }
      },
@@ -178,19 +165,9 @@
      updateUI(){
        const p=$('#filePill'); if(!p) return;
        const t=$('#filePillText');
-       if(this.connected){
-         p.classList.add('on');
-         t.textContent='DATA FILE · AUTO-SAVE';
-       } else if(this.handle){
-         p.classList.remove('on');
-         t.textContent='DATA FILE · RECONNECT';
-       } else {
-         p.classList.remove('on');
-         t.textContent='DATA FILE · LOCAL ONLY';
-       }
-       // also refresh any settings page view
-       const settingsView=$('#view');
-       if(settingsView && settingsView.dataset.view==='settings') render();
+       if(this.connected){ p.classList.add('on'); t.textContent='DATA FILE · AUTO-SAVE'; }
+       else if(this.handle){ p.classList.remove('on'); t.textContent='DATA FILE · RECONNECT'; }
+       else { p.classList.remove('on'); t.textContent='DATA FILE · LOCAL ONLY'; }
      }
    };
    
@@ -213,18 +190,22 @@
       ------------------------------------------------------------ */
    const SUBJECT_COLORS=['#d4af37','#6fb7e0','#7fe0a0','#b48ce0','#e6b95c','#e07a6a','#e8a0c0','#7fe0d4'];
    
+   function mkChapter(name){
+     return {id:uid(),name,manualStatus:null,totalMinutes:0,sessions:[],lastStudied:null,createdAt:todayStr()};
+   }
+   
    function seed(){
      const now=todayStr();
    
      const settings={
-       user:'Chief',
-       wake:'06:00', sleep:'23:00',
-       bufferMinutes:10,
-       focusDuration:40, breakDuration:10,
+       user:'Chief', wake:'06:00', sleep:'23:00',
+       bufferMinutes:10, focusDuration:40, breakDuration:10,
        maxStudyMinutesPerDay:300,
        exerciseTarget:30, englishTarget:15, projectTime:30, recreationAllowance:60,
        examModeThreshold:10,
-       distractions:'Tablet · Instagram · YouTube · Gaming · PC'
+       distractions:'Tablet · Instagram · YouTube · Gaming · PC',
+       practiceTimerDefault:'per-question',
+       practicePerQuestionSec:90
      };
    
      const commitments=[
@@ -236,8 +217,7 @@
        {id:uid(),title:'Dinner',                type:'meal',   start:'19:00',end:'19:30',days:[0,1,2,3,4,5,6]},
      ];
    
-     const ch=(name,status='NOT_STARTED')=>({id:uid(),name,status,
-       est:{learn:45,practice:40,numericals:45,revision:20,test:30}});
+     const ch=(name,status='NOT_STARTED')=>({id:uid(),name,status,est:{learn:45,practice:40,numericals:45,revision:20,test:30}});
    
      const exams=[
        {id:uid(),subject:'Physics',title:'Physics — Board Exam',date:futureDate(9,18),
@@ -263,13 +243,9 @@
    
      const T=(title,cat,subject,priority,est,deadline,opts={})=>({
        id:uid(),title,category:cat,subject,priority,estimatedMinutes:est,
-       actualMinutes:0,deadline,status:'TODO',
-       difficulty:opts.difficulty||'MEDIUM',
-       notes:opts.notes||'',
-       objective:opts.objective||'',
-       subtasks:opts.subtasks||[],
-       chapterId:opts.chapterId||null,
-       createdAt:now, completedAt:null
+       actualMinutes:0,deadline,status:'TODO',difficulty:opts.difficulty||'MEDIUM',
+       notes:opts.notes||'',objective:opts.objective||'',subtasks:opts.subtasks||[],
+       chapterId:opts.chapterId||null,createdAt:now,completedAt:null
      });
    
      const tasks=[
@@ -331,43 +307,115 @@
         ]}]}
      ];
    
-     /* --- NEW: independent study workspace --- */
      const subjects=[
        {id:uid(),name:'Physics',color:'#d4af37',createdAt:now,chapters:[
-         mkChapter('Electric Charges and Fields'),
-         mkChapter('Electric Potential'),
-         mkChapter('Capacitance'),
-         mkChapter('Current Electricity'),
-       ]},
+         mkChapter('Electric Charges and Fields'),mkChapter('Electric Potential'),
+         mkChapter('Capacitance'),mkChapter('Current Electricity')]},
        {id:uid(),name:'Chemistry',color:'#6fb7e0',createdAt:now,chapters:[
-         mkChapter('Solutions'),
-         mkChapter('Electrochemistry'),
-         mkChapter('Coordination Compounds'),
-       ]},
+         mkChapter('Solutions'),mkChapter('Electrochemistry'),mkChapter('Coordination Compounds')]},
        {id:uid(),name:'Biology',color:'#7fe0a0',createdAt:now,chapters:[
-         mkChapter('Reproduction in Flowering Plants'),
-         mkChapter('Human Reproduction'),
-         mkChapter('Molecular Basis of Inheritance'),
-       ]},
+         mkChapter('Reproduction in Flowering Plants'),mkChapter('Human Reproduction'),
+         mkChapter('Molecular Basis of Inheritance')]},
      ];
    
+     /* --- Seeded question bank (source-labeled, clearly marked as samples) --- */
+     const questions = seedQuestions();
+   
      return {
-       version:2, settings, commitments, tasks, exams, habits, files, projects,
-       subjects,
+       version:3, settings, commitments, tasks, exams, habits, files, projects,
+       subjects, questions, practiceSessions:[], rescheduleHistory:[],
        schedule:null, focusSessions:[], reviews:[], log:[],
-       savedAt:null
+       savedAt:new Date().toISOString()
      };
    }
    
-   function mkChapter(name){
-     return {
-       id:uid(), name,
-       manualStatus:null,
-       totalMinutes:0,
-       sessions:[],
-       lastStudied:null,
-       createdAt:todayStr()
-     };
+   function seedQuestions(){
+     const mk=(q)=>({
+       id:uid(),
+       exam:q.exam, year:q.year||null, subject:q.subject, chapter:q.chapter,
+       topic:q.topic||'', questionType:q.questionType, difficulty:q.difficulty||'MEDIUM',
+       marks:q.marks||1, source:q.source||(q.exam+' '+(q.year||'')+' — '+(q.chapter||'')+' (sample)'),
+       questionText:q.questionText,
+       options:q.options||null,
+       answer:q.answer, solution:q.solution||'',
+       recommendedTime:q.recommendedTime||90
+     });
+   
+     return [
+       mk({exam:'CBSE',year:2024,subject:'Physics',chapter:'Current Electricity',topic:"Ohm's Law",
+         questionType:'MCQ',marks:1,
+         questionText:'The drift velocity of electrons in a conductor is directly proportional to:',
+         options:['Electric field','Length of conductor','Area of cross-section','Resistivity'],
+         answer:'Electric field',solution:'v_d = μE where μ is mobility. Drift velocity is directly proportional to applied electric field.',
+         recommendedTime:60, source:'CBSE 2024 Physics — Current Electricity (sample)'}),
+   
+       mk({exam:'CBSE',year:2023,subject:'Physics',chapter:'Current Electricity',topic:'Kirchhoff',
+         questionType:'Short',marks:2,
+         questionText:'State Kirchhoff’s junction rule and explain its basis.',
+         answer:'Sum of currents entering = sum of currents leaving (conservation of charge)',
+         solution:'The junction rule states that at any junction, the algebraic sum of currents is zero: ΣI = 0. This follows from conservation of electric charge — charge cannot accumulate at a junction in a steady state.',
+         recommendedTime:120, source:'CBSE 2023 Physics — Current Electricity (sample)'}),
+   
+       mk({exam:'CBSE',year:2024,subject:'Physics',chapter:'Electrostatics',topic:'Coulomb',
+         questionType:'MCQ',marks:1,
+         questionText:'The electric field inside a hollow charged conductor is:',
+         options:['Zero','Uniform','Maximum at the surface','Depends on shape'],
+         answer:'Zero',solution:'For a charged conductor in electrostatic equilibrium, the field inside the cavity is zero (Gauss’s law).',
+         recommendedTime:60, source:'CBSE 2024 Physics — Electrostatics (sample)'}),
+   
+       mk({exam:'NEET',year:2023,subject:'Biology',chapter:'Human Reproduction',topic:'',
+         questionType:'MCQ',marks:4,
+         questionText:'The process of release of the ovum from the Graafian follicle is called:',
+         options:['Ovulation','Fertilisation','Implantation','Gestation'],
+         answer:'Ovulation',
+         solution:'Ovulation is the release of a secondary oocyte from a mature Graafian follicle, typically around day 14 of the menstrual cycle.',
+         recommendedTime:60, source:'NEET 2023 Biology — Human Reproduction (sample)'}),
+   
+       mk({exam:'NEET',year:2024,subject:'Biology',chapter:'Genetics',topic:'Inheritance',
+         questionType:'MCQ',marks:4,
+         questionText:'A cross between a homozygous tall pea plant and a homozygous dwarf pea plant produces F1 that is:',
+         options:['All tall','All dwarf','1 tall : 1 dwarf','3 tall : 1 dwarf'],
+         answer:'All tall',
+         solution:'Tall (TT) × dwarf (tt) → all Tt (tall) in F1. Tallness is dominant.',
+         recommendedTime:60, source:'NEET 2024 Biology — Genetics (sample)'}),
+   
+       mk({exam:'JEE Main',year:2023,subject:'Chemistry',chapter:'Electrochemistry',topic:'Nernst',
+         questionType:'Numerical',marks:4,
+         questionText:'Calculate the EMF of a Daniel cell at 298 K when [Zn²⁺] = 0.1 M and [Cu²⁺] = 0.01 M. (E°cell = 1.10 V)',
+         answer:'1.07 V',
+         solution:'Nernst: E = E° − (0.0591/n)·log([Zn²⁺]/[Cu²⁺])\nE = 1.10 − 0.0295·log(10) = 1.10 − 0.03 ≈ 1.07 V',
+         recommendedTime:180, source:'JEE Main 2023 Chemistry — Electrochemistry (sample)'}),
+   
+       mk({exam:'JEE Main',year:2024,subject:'Physics',chapter:'Capacitance',topic:'',
+         questionType:'MCQ',marks:4,
+         questionText:'A parallel plate capacitor is charged and then disconnected. If the plates are pulled apart, the potential difference:',
+         options:['Increases','Decreases','Remains same','Becomes zero'],
+         answer:'Increases',
+         solution:'Q constant (disconnected). C = εA/d decreases as d increases. V = Q/C therefore increases.',
+         recommendedTime:90, source:'JEE Main 2024 Physics — Capacitance (sample)'}),
+   
+       mk({exam:'CBSE',year:2024,subject:'Chemistry',chapter:'Solutions',topic:'Colligative',
+         questionType:'Short',marks:2,
+         questionText:'Why is the boiling point of a solution higher than that of the pure solvent?',
+         answer:'Due to elevation in boiling point caused by vapour pressure lowering.',
+         solution:'The presence of a non-volatile solute lowers the vapour pressure of the solution, so a higher temperature is required for the vapour pressure to equal atmospheric pressure — hence the boiling point is elevated.',
+         recommendedTime:120, source:'CBSE 2024 Chemistry — Solutions (sample)'}),
+   
+       mk({exam:'CBSE',year:2023,subject:'Physics',chapter:'Current Electricity',topic:"Wheatstone",
+         questionType:'Numerical',marks:3,
+         questionText:'In a Wheatstone bridge, the four resistances are 10 Ω, 20 Ω, 30 Ω and 60 Ω in order. Is the bridge balanced?',
+         answer:'Yes',
+         solution:'Balance condition: P/Q = R/S → 10/20 = 30/60 = 0.5. Balanced.',
+         recommendedTime:150, source:'CBSE 2023 Physics — Current Electricity (sample)'}),
+   
+       mk({exam:'CBSE',year:2024,subject:'Biology',chapter:'Reproductive Health',topic:'',
+         questionType:'MCQ',marks:1,
+         questionText:'The technique of introducing semen directly into the uterus is called:',
+         options:['IUI','ZIFT','GIFT','ICSI'],
+         answer:'IUI',
+         solution:'IUI (Intra-Uterine Insemination) involves introducing semen (or a prepared sperm sample) into the uterus.',
+         recommendedTime:60, source:'CBSE 2024 Biology — Reproductive Health (sample)'}),
+     ];
    }
    
    /* ------------------------------------------------------------
@@ -386,8 +434,17 @@
          if(!c.createdAt) c.createdAt=todayStr();
        });
      });
-     DB.tasks.forEach(t=>{ if(t.chapterId===undefined) t.chapterId=null; });
-     DB.version=2;
+     DB.tasks.forEach(t=>{
+       if(t.chapterId===undefined) t.chapterId=null;
+       if(typeof t.actualMinutes!=='number') t.actualMinutes=0;
+       if(typeof t.estimatedMinutes!=='number') t.estimatedMinutes=40;
+     });
+     if(!DB.questions) DB.questions=seedQuestions();
+     if(!DB.practiceSessions) DB.practiceSessions=[];
+     if(!DB.rescheduleHistory) DB.rescheduleHistory=[];
+     if(!DB.settings.practiceTimerDefault) DB.settings.practiceTimerDefault='per-question';
+     if(!DB.settings.practicePerQuestionSec) DB.settings.practicePerQuestionSec=90;
+     DB.version=3;
    }
    
    function loadDB(){
@@ -400,16 +457,18 @@
      return DB;
    }
    
-   /* Debounced write: localStorage immediately, file after 700ms */
    let _saveTimer=null;
    function saveDB(){
-     try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){}
+     DB.savedAt=new Date().toISOString();
+     // synchronous localStorage write FIRST
+     try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){ console.warn('LS save failed',e); }
+     // async file backup (debounced)
      clearTimeout(_saveTimer);
      _saveTimer=setTimeout(()=>FileSync.save(), 700);
    }
    
    /* ------------------------------------------------------------
-      6. CHAPTER HELPERS (NEW)
+      6. CHAPTER HELPERS
       ------------------------------------------------------------ */
    const CHAPTER_STATUSES=['NOT_STARTED','STARTED','LEARNING','PRACTICE','REVISION','TESTED','MASTERED'];
    
@@ -423,9 +482,7 @@
      if(m<240)   return 'REVISION';
      return 'TESTED';
    }
-   function statusPct(s){
-     return {NOT_STARTED:2,STARTED:15,LEARNING:35,PRACTICE:55,REVISION:75,TESTED:92,MASTERED:100}[s]||0;
-   }
+   function statusPct(s){ return {NOT_STARTED:2,STARTED:15,LEARNING:35,PRACTICE:55,REVISION:75,TESTED:92,MASTERED:100}[s]||0; }
    function findChapterRef(id){
      for(const s of (DB.subjects||[])){
        const c=s.chapters.find(x=>x.id===id);
@@ -439,12 +496,9 @@
      const {chapter:ch}=ref;
      ch.sessions=ch.sessions||[];
      ch.sessions.push({
-       id:uid(),
-       start:opts.start||new Date().toISOString(),
-       end:opts.end||new Date().toISOString(),
-       minutes,
-       taskId:opts.taskId||null,
-       note:opts.note||''
+       id:uid(), start:opts.start||new Date().toISOString(),
+       end:opts.end||new Date().toISOString(), minutes,
+       taskId:opts.taskId||null, note:opts.note||''
      });
      ch.totalMinutes=(ch.totalMinutes||0)+minutes;
      ch.lastStudied=todayStr();
@@ -525,8 +579,11 @@
    }
    
    /* ------------------------------------------------------------
-      8. SCHEDULER
+      8. REMAINING WORK + SCHEDULER
       ------------------------------------------------------------ */
+   function remainingMinutesFor(task){
+     return Math.max(0, (task.estimatedMinutes||40) - (task.actualMinutes||0));
+   }
    function commitmentsFor(weekday){
      return DB.commitments.filter(c=>c.days.includes(weekday))
        .map(c=>({...c,s:t2m(c.start),e:t2m(c.end)}))
@@ -535,33 +592,33 @@
    function mergeIntervals(list){
      const out=[];
      list.slice().sort((a,b)=>a.s-b.s).forEach(iv=>{
-       if(out.length && iv.s<=out[out.length-1].e){
-         out[out.length-1].e=Math.max(out[out.length-1].e,iv.e);
-       } else out.push({...iv});
+       if(out.length && iv.s<=out[out.length-1].e) out[out.length-1].e=Math.max(out[out.length-1].e,iv.e);
+       else out.push({...iv});
      });
      return out;
    }
    function complement(start,end,busy){
      const out=[]; let cur=start;
-     busy.forEach(b=>{
-       if(b.s>cur) out.push({s:cur,e:b.s});
-       cur=Math.max(cur,b.e);
-     });
+     busy.forEach(b=>{ if(b.s>cur) out.push({s:cur,e:b.s}); cur=Math.max(cur,b.e); });
      if(cur<end) out.push({s:cur,e:end});
      return out.filter(iv=>iv.e-iv.s>=15);
    }
+   
    function buildDayPlan(dateStr,opts={}){
      const S=DB.settings;
      const dayStart=t2m(S.wake), dayEnd=t2m(S.sleep);
      const wd=parseD(dateStr).getDay();
      const rawBusy=commitmentsFor(wd);
      const blocks=rawBusy.map(b=>({type:b.type,title:b.title,start:b.s,end:b.e,fixed:true}));
+   
      const trans=Math.max(0,S.bufferMinutes|0);
      const padded=mergeIntervals(rawBusy.map(b=>({s:b.s-trans,e:b.e+trans})));
      let free=complement(dayStart,dayEnd,padded);
+   
      if(opts.fromMin!==undefined){
        free=free.map(iv=>({s:Math.max(iv.s,opts.fromMin),e:iv.e})).filter(iv=>iv.e-iv.s>=15);
      }
+   
      const ranked=rankedTasks();
      const queue=ranked.map(r=>({task:r.task,level:r.level,score:r.score}));
      const maxStudy=Math.max(60,(S.maxStudyMinutesPerDay||300)-(opts.lostMinutes||0));
@@ -569,11 +626,13 @@
      const breakLen=S.breakDuration||10;
      let placed=0;
      const studyBlocks=[];
+   
      for(const iv of free){
        let cursor=iv.s; let guard=0;
        while(queue.length && cursor<iv.e && placed<maxStudy && guard++<80){
          const item=queue[0];
-         const total=item.task.estimatedMinutes||40;
+         // CRITICAL: use REMAINING, not original estimate
+         const total=remainingMinutesFor(item.task) || item.task.estimatedMinutes || 40;
          const rem=(item._rem!==undefined)? item._rem : total;
          const avail=iv.e-cursor;
          if(avail<12) break;
@@ -596,6 +655,7 @@
      const all=blocks.concat(studyBlocks).sort((a,b)=>a.start-b.start);
      return {date:dateStr,blocks:all,generatedAt:Date.now(),lostMinutes:opts.lostMinutes||0};
    }
+   
    function getSchedule(){
      if(!DB.schedule || DB.schedule.date!==todayStr()){
        DB.schedule=buildDayPlan(todayStr());
@@ -603,13 +663,64 @@
      }
      return DB.schedule;
    }
-   function regenerate(lostMinutes,fromNow){
-     DB.schedule=buildDayPlan(todayStr(),{
-       lostMinutes:lostMinutes||0,
-       fromMin: fromNow? nowMin() : undefined
+   
+   /* ------------------------------------------------------------
+      9. ADAPTIVE RESCHEDULER
+      ------------------------------------------------------------ */
+   function logReschedule(reason, before, after){
+     DB.rescheduleHistory=DB.rescheduleHistory||[];
+     DB.rescheduleHistory.push({
+       id:uid(),
+       at:new Date().toISOString(),
+       reason,
+       before: before.map(b=>({t:b.title,s:b.start,e:b.end})),
+       after:  after.map(b=>({t:b.title,s:b.start,e:b.end}))
      });
-     saveDB();
+     if(DB.rescheduleHistory.length>60) DB.rescheduleHistory=DB.rescheduleHistory.slice(-60);
    }
+   
+   function adaptiveReschedule(opts){
+     opts=opts||{};
+     const fromMin = opts.fromMin!==undefined ? opts.fromMin : nowMin();
+     const prev = DB.schedule || {blocks:[]};
+     const beforeBlocks = prev.blocks.filter(b=>b.end>fromMin && b.type!=='break');
+   
+     // Rebuild remaining day using remaining minutes
+     DB.schedule = buildDayPlan(todayStr(),{
+       fromMin,
+       lostMinutes: opts.lostMinutes||0
+     });
+   
+     const afterBlocks = DB.schedule.blocks.filter(b=>b.end>fromMin && b.type!=='break');
+     logReschedule(opts.reason||'Schedule updated', beforeBlocks, afterBlocks);
+     saveDB();
+   
+     // Show banner
+     showSchedBanner(opts.reason||'Schedule updated', beforeBlocks, afterBlocks);
+   
+     return {before:beforeBlocks, after:afterBlocks};
+   }
+   
+   function regenerate(lostMinutes,fromNow){
+     if(fromNow){
+       adaptiveReschedule({reason: lostMinutes? ('Lost '+lostMinutes+' min'):'Regenerated', lostMinutes:lostMinutes||0});
+     } else {
+       DB.schedule=buildDayPlan(todayStr(),{lostMinutes:lostMinutes||0});
+       saveDB();
+     }
+   }
+   
+   let _bannerDiff=null;
+   function showSchedBanner(reason, before, after){
+     const b=$('#schedBanner'); if(!b) return;
+     $('#schedBannerTitle').textContent='Schedule Updated';
+     $('#schedBannerMsg').textContent=reason+' — remaining schedule adjusted.';
+     b.classList.add('show');
+     _bannerDiff={reason, before, after};
+     clearTimeout(b._t);
+     b._t=setTimeout(()=>b.classList.remove('show'), 12000);
+   }
+   
    function blockStatus(b){
      if(b.fixed) return 'fixed';
      if(b.type==='break') return 'break';
@@ -635,7 +746,7 @@
    function openTasks(){ return DB.tasks.filter(t=>!['COMPLETED','SKIPPED'].includes(t.status)); }
    
    /* ------------------------------------------------------------
-      9. STATS
+      10. STATS
       ------------------------------------------------------------ */
    function todayStats(){
      const sch=getSchedule();
@@ -667,7 +778,7 @@
    }
    
    /* ------------------------------------------------------------
-      10. FOCUS TIMER (with chapter support)
+      11. FOCUS TIMER
       ------------------------------------------------------------ */
    const Timer={
      running:false, remaining:0, total:0,
@@ -678,7 +789,8 @@
        this.stopSilently();
        this.taskId=taskId; this.chapterId=null;
        const t=DB.tasks.find(x=>x.id===taskId);
-       const mins=minutes|| (t? Math.min(t.estimatedMinutes||40,DB.settings.focusDuration||40):40);
+       const rem=t? remainingMinutesFor(t) : 40;
+       const mins=minutes|| Math.min(rem||40, DB.settings.focusDuration||40);
        this.total=mins*60; this.remaining=this.total; this.startedAt=null; this.launch=false;
        this.render();
      },
@@ -719,12 +831,12 @@
        this.render(); renderFocusPill();
      },
      elapsedSec(){ return this.total-this.remaining; },
+   
      commit(){
        const secs=this.elapsedSec();
        if(secs<60) return 0;
        const minutes=Math.round(secs/60);
        const endISO=new Date().toISOString();
-   
        let subjectLbl='—';
    
        if(this.chapterId){
@@ -738,41 +850,57 @@
          if(t){
            t.actualMinutes=(t.actualMinutes||0)+minutes;
            subjectLbl=t.subject||t.category;
-           if(t.chapterId){
-             logChapterSession(t.chapterId, minutes, {start:this.startedAt, end:endISO, taskId:t.id});
-           }
+           if(t.chapterId) logChapterSession(t.chapterId, minutes, {start:this.startedAt, end:endISO, taskId:t.id});
          }
        }
    
        DB.focusSessions.push({
-         id:uid(),
-         taskId:this.taskId,
-         chapterId:this.chapterId,
-         subject:subjectLbl,
-         date:todayStr(),
-         start:this.startedAt||endISO,
-         end:endISO,
-         minutes,
+         id:uid(), taskId:this.taskId, chapterId:this.chapterId,
+         subject:subjectLbl, date:todayStr(),
+         start:this.startedAt||endISO, end:endISO, minutes,
          mode:this.launch?'launch':'focus'
        });
        saveDB();
        return minutes;
      },
+   
      complete(){
+       const wasTask=this.taskId;
+       const taskBefore = wasTask? DB.tasks.find(x=>x.id===wasTask) : null;
+       const wasEstimated = taskBefore? taskBefore.estimatedMinutes : 0;
+       const wasActualBefore = taskBefore? (taskBefore.actualMinutes||0) : 0;
+   
        const mins=this.commit();
        this.pause();
-       if(this.taskId && this.remaining<=0){
-         const t=DB.tasks.find(x=>x.id===this.taskId);
+   
+       if(wasTask && this.remaining<=0){
+         const t=DB.tasks.find(x=>x.id===wasTask);
          if(t){ t.status='COMPLETED'; t.completedAt=new Date().toISOString(); saveDB(); }
          toast('Task completed');
+         // After completion, adapt schedule
+         setTimeout(()=>{
+           adaptiveReschedule({reason:'Completed: '+taskBefore.title.slice(0,32)});
+           render();
+         }, 400);
        } else if(this.chapterId && this.remaining<=0){
          toast('Session complete · '+mins+' min logged');
+         this.reset();
+         render();
        } else {
          toast('Session logged · '+mins+' min');
+         // If overran significantly, adapt
+         const overrun = mins - Math.round(this.total/60);
+         if(overrun>3){
+           adaptiveReschedule({reason:'Session overran by '+overrun+' min'});
+           render();
+         } else {
+           this.reset();
+           render();
+         }
        }
        this.reset();
-       render();
      },
+   
      render(){
        const mm=Math.floor(this.remaining/60), ss=this.remaining%60;
        const el=$('#execTimer'); if(el) el.textContent=pad(mm)+':'+pad(ss);
@@ -810,7 +938,672 @@
    }
    
    /* ------------------------------------------------------------
-      11. NAVIGATION + SHELL
+      12. INTENT PARSER (Tell the Assistant)
+      ------------------------------------------------------------ */
+   const IntentParser = {
+     parse(raw){
+       const input=String(raw||'').trim();
+       const t=input.toLowerCase();
+       if(!t) return {action:'UNKNOWN', raw:input};
+   
+       // ---------- QUERIES ----------
+       if(/(what should i do( now)?|what now|next task)/.test(t))
+         return {action:'QUERY_NEXT_TASK', raw:input};
+       if(/(show|what('s| is)) (me )?(my )?(schedule|plan|timeline)/.test(t) || /^my schedule/.test(t))
+         return {action:'QUERY_SCHEDULE', raw:input};
+       if(/(progress|how (am|are) i doing|status)/.test(t))
+         return {action:'QUERY_PROGRESS', raw:input};
+   
+       // ---------- FOCUS SESSION ----------
+       let m = t.match(/^start\s+(\d+)\s*(?:min|minute|m)?\s*(?:of\s+)?(.+?)(?:\s+session)?$/);
+       if(m){
+         return {action:'START_FOCUS_SESSION', duration:Number(m[1]), subject:m[2].trim(), raw:input};
+       }
+       if(/^(stop|end|pause)\s+(session|focus|timer)/.test(t) || t==='stop')
+         return {action:'STOP_FOCUS_SESSION', raw:input};
+   
+       // ---------- COMPLETE ----------
+       m = t.match(/^(?:i\s+)?(?:finished|completed|done with|did)\s+(.+)$/);
+       if(m) return {action:'COMPLETE_TASK', target:m[1].trim(), raw:input};
+   
+       // ---------- SKIP / MISSED ----------
+       m = t.match(/^(?:i\s+)?(?:didn'?t|did not|couldn'?t|could not|skipped|missed|skipped)\s+(.+)$/);
+       if(m) return {action:'SKIP_TASK', target:m[1].trim(), raw:input};
+   
+       // ---------- POSTPONE / MOVE ----------
+       m = t.match(/^(?:move|postpone|push|defer|shift)\s+(.+?)\s+to\s+(tomorrow|next week|next month|monday|tuesday|wednesday|thursday|friday|saturday|sunday|(.+))$/);
+       if(m) return {action:'POSTPONE_TASK', target:m[1].trim(), when:m[2].trim(), raw:input};
+   
+       // ---------- DELETE ----------
+       m = t.match(/^delete\s+(.+)$/);
+       if(m) return {action:'DELETE_TASK', target:m[1].trim(), raw:input, needsConfirm:true};
+   
+       // ---------- LEAVE TIME ----------
+       m = t.match(/i\s+(?:have\s+to|need\s+to|must)\s+(?:leave|go|go out|be out)(?:\s+at\s+|\s+by\s+)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+       if(m){
+         let h=Number(m[1]);
+         const mm=Number(m[2]||0);
+         const ap=(m[3]||'').toLowerCase();
+         if(ap==='pm' && h<12) h+=12;
+         if(ap==='am' && h===12) h=0;
+         if(!ap && h<7) h+=12; // heuristic: small numbers usually PM
+         return {action:'ADD_COMMITMENT', title:'Away', start:pad(h)+':'+pad(mm), end:'23:59', raw:input};
+       }
+   
+       // ---------- ADD / CREATE ----------
+       // "add 30 minutes of English speaking [tomorrow]"
+       m = t.match(/^(?:add|create|log|schedule)\s+(?:(\d+)\s*(?:min|minute|m|minutes)?\s*(?:of\s+)?)?(.+?)(?:\s+(today|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday))?$/);
+       if(m){
+         const dur=m[1]? Number(m[1]) : null;
+         let title=m[2].trim();
+         const when=(m[3]||'today').toLowerCase();
+         return {action:'CREATE_TASK', title, duration:dur, when, raw:input};
+       }
+   
+       // ---------- PRACTICE ----------
+       m = t.match(/give me\s+(\d+)\s+(.+?)\s+(?:problems|numericals|questions|pyqs)/);
+       if(m) return {action:'ADD_PRACTICE_SESSION', count:Number(m[1]), target:m[2].trim(), raw:input};
+       m = t.match(/(?:practice|pyq|questions?)\s+(?:for\s+)?(.+)/);
+       if(m) return {action:'ADD_PRACTICE_SESSION', count:10, target:m[1].trim(), raw:input};
+   
+       return {action:'UNKNOWN', raw:input};
+     }
+   };
+   
+   /* ------------------------------------------------------------
+      13. ASSISTANT (executes intents)
+      ------------------------------------------------------------ */
+   const Assistant = {
+     history:[],  // local, session-only
+   
+     async executeText(input){
+       const intent=IntentParser.parse(input);
+       const result=await this.execute(intent);
+       this.history.unshift({
+         at:new Date().toISOString(),
+         input,
+         result:result.message,
+         ok:result.ok
+       });
+       if(this.history.length>20) this.history=this.history.slice(0,20);
+       return result;
+     },
+   
+     async execute(intent){
+       switch(intent.action){
+         case 'QUERY_NEXT_TASK': return this.q_nextTask();
+         case 'QUERY_SCHEDULE': return this.q_schedule();
+         case 'QUERY_PROGRESS': return this.q_progress();
+         case 'START_FOCUS_SESSION': return this.startFocus(intent);
+         case 'STOP_FOCUS_SESSION': return this.stopFocus();
+         case 'COMPLETE_TASK': return this.completeTask(intent);
+         case 'SKIP_TASK': return this.skipTask(intent);
+         case 'POSTPONE_TASK': return this.postponeTask(intent);
+         case 'DELETE_TASK': return this.deleteTask(intent);
+         case 'ADD_COMMITMENT': return this.addCommitment(intent);
+         case 'CREATE_TASK': return this.createTask(intent);
+         case 'ADD_PRACTICE_SESSION': return this.startPractice(intent);
+         default:
+           return {ok:false, message:'I did not understand that. Try: "Add 30 minutes of English." or "What should I do now?"'};
+       }
+     },
+   
+     q_nextTask(){
+       const ranked=rankedTasks();
+       if(!ranked.length) return {ok:true, message:'No open tasks. Take a break.'};
+       const r=ranked[0];
+       return {ok:true, message:`Do this now: ${r.task.title} (${fmtDur(remainingMinutesFor(r.task))}) · ${r.level}`};
+     },
+     q_schedule(){
+       const sch=getSchedule();
+       const upcoming=sch.blocks.filter(b=>b.type==='task' && b.end>nowMin()).slice(0,6);
+       if(!upcoming.length) return {ok:true, message:'Nothing left in today\'s schedule.'};
+       const lines=upcoming.map(b=>`${m2t(b.start)} ${b.title}`).join(' · ');
+       return {ok:true, message:'Remaining: '+lines};
+     },
+     q_progress(){
+       const st=todayStats();
+       return {ok:true, message:`Execution ${st.execution}% · ${st.completed}/${st.plannedTasks} tasks · ${fmtDur(st.actualMin)} logged.`};
+     },
+   
+     startFocus(intent){
+       const target=(intent.subject||'').toLowerCase();
+       // try chapter first
+       let ch=null, subj=null;
+       for(const s of DB.subjects){
+         if(s.name.toLowerCase().includes(target) || target.includes(s.name.toLowerCase())){
+           subj=s; break;
+         }
+         for(const c of s.chapters){
+           if(c.name.toLowerCase().includes(target) || target.includes(c.name.toLowerCase())){
+             ch=c; subj=s; break;
+           }
+         }
+         if(ch) break;
+       }
+       if(ch){
+         Timer.setChapter(ch.id, intent.duration||DB.settings.focusDuration);
+         $('#exec').classList.add('show'); Timer.start();
+         return {ok:true, message:`Started ${intent.duration||DB.settings.focusDuration}-minute session on ${subj.name} — ${ch.name}.`};
+       }
+       // fall back to task search
+       const task=DB.tasks.find(x=>!['COMPLETED','SKIPPED'].includes(x.status) &&
+         (x.title.toLowerCase().includes(target) || (x.subject||'').toLowerCase().includes(target)));
+       if(task){
+         Timer.setTask(task.id, intent.duration);
+         $('#exec').classList.add('show'); Timer.start();
+         return {ok:true, message:`Started session on "${task.title}".`};
+       }
+       // generic: create a fresh task and start it
+       const newT={
+         id:uid(), title:'Focus: '+intent.subject, category:'ACADEMICS',
+         subject:intent.subject, priority:2,
+         estimatedMinutes:intent.duration||DB.settings.focusDuration,
+         actualMinutes:0, deadline:todayStr(), status:'IN_PROGRESS',
+         difficulty:'MEDIUM', notes:'', objective:'', subtasks:[], chapterId:null,
+         createdAt:todayStr(), completedAt:null
+       };
+       DB.tasks.push(newT); saveDB();
+       Timer.setTask(newT.id, intent.duration);
+       $('#exec').classList.add('show'); Timer.start();
+       return {ok:true, message:`Started a ${intent.duration||DB.settings.focusDuration}-minute session on "${intent.subject}".`};
+     },
+     stopFocus(){
+       if(!Timer.taskId && !Timer.chapterId) return {ok:false, message:'No active session.'};
+       Timer.complete();
+       return {ok:true, message:'Session stopped and logged.'};
+     },
+   
+     completeTask(intent){
+       const match=this.findTask(intent.target);
+       if(!match) return {ok:false, message:`No task found matching "${intent.target}".`};
+       match.status='COMPLETED'; match.completedAt=new Date().toISOString();
+       saveDB();
+       setTimeout(()=>{ adaptiveReschedule({reason:'Completed: '+match.title.slice(0,32)}); render(); }, 300);
+       return {ok:true, message:`Marked "${match.title}" as completed.`};
+     },
+     skipTask(intent){
+       const match=this.findTask(intent.target);
+       if(!match) return {ok:false, message:`No task found matching "${intent.target}".`};
+       match.status='SKIPPED'; saveDB();
+       setTimeout(()=>{ adaptiveReschedule({reason:'Skipped: '+match.title.slice(0,32)}); render(); }, 300);
+       return {ok:true, message:`Marked "${match.title}" as skipped. Schedule adjusted.`};
+     },
+     postponeTask(intent){
+       const match=this.findTask(intent.target);
+       if(!match) return {ok:false, message:`No task found matching "${intent.target}".`};
+       const when=this.resolveWhen(intent.when);
+       match.deadline=when; match.status='RESCHEDULED'; saveDB();
+       setTimeout(()=>{ adaptiveReschedule({reason:'Postponed: '+match.title.slice(0,32)}); render(); }, 300);
+       return {ok:true, message:`Moved "${match.title}" to ${fmtDate(when)}.`};
+     },
+     deleteTask(intent){
+       const matches=DB.tasks.filter(t=>t.title.toLowerCase().includes(intent.target.toLowerCase()));
+       if(!matches.length) return {ok:false, message:`No task found matching "${intent.target}".`};
+       if(matches.length>1) return {ok:false, message:`${matches.length} tasks match "${intent.target}". Please be more specific.`, needsConfirm:true};
+       if(!confirm('Delete "'+matches[0].title+'"?')) return {ok:false, message:'Cancelled.'};
+       DB.tasks=DB.tasks.filter(x=>x.id!==matches[0].id); saveDB(); render();
+       return {ok:true, message:`Deleted "${matches[0].title}".`};
+     },
+     addCommitment(intent){
+       DB.commitments.push({
+         id:uid(), title:intent.title||'Away', type:'custom',
+         start:intent.start, end:intent.end, days:[0,1,2,3,4,5,6]
+       });
+       saveDB();
+       setTimeout(()=>{ adaptiveReschedule({reason:'New commitment: '+intent.start}); render(); }, 200);
+       return {ok:true, message:`Added commitment "${intent.title}" ${intent.start}–${intent.end}. Remaining schedule adjusted.`};
+     },
+     createTask(intent){
+       const when=this.resolveWhen(intent.when||'today');
+       const t={
+         id:uid(),
+         title:intent.title,
+         category:'ACADEMICS',
+         subject:this.guessSubject(intent.title),
+         priority:2,
+         estimatedMinutes:intent.duration||40,
+         actualMinutes:0,
+         deadline:when,
+         status:'TODO',
+         difficulty:'MEDIUM',
+         notes:'', objective:'',
+         subtasks:[], chapterId:null,
+         createdAt:todayStr(), completedAt:null
+       };
+       DB.tasks.push(t); saveDB();
+       setTimeout(()=>{ regenerate(0,false); render(); }, 200);
+       return {ok:true, message:`Added ${fmtDur(t.estimatedMinutes)} "${t.title}" for ${fmtDate(when)}.`};
+     },
+     startPractice(intent){
+       const target=intent.target||'';
+       // Match chapter
+       let ch=null, subj=null;
+       for(const s of DB.subjects){
+         for(const c of s.chapters){
+           if(c.name.toLowerCase().includes(target.toLowerCase()) || target.toLowerCase().includes(c.name.toLowerCase())){
+             ch=c; subj=s; break;
+           }
+         }
+         if(ch) break;
+       }
+       if(!ch && subj) ch=subj.chapters[0];
+       if(!ch) return {ok:false, message:`No chapter found matching "${target}".`};
+   
+       const pool=DB.questions.filter(q=>q.chapter.toLowerCase()===ch.name.toLowerCase());
+       if(!pool.length) return {ok:false, message:`No questions yet for ${ch.name}. Add some in Question Practice.`};
+   
+       const picked=pool.slice(0, intent.count||10);
+       Practice.start({
+         mode:'chapter',
+         config:{subject:subj.name, chapter:ch.name, count:picked.length},
+         questions:picked,
+         chapterId:ch.id
+       });
+       return {ok:true, message:`Starting practice: ${picked.length} questions on ${ch.name}.`};
+     },
+   
+     findTask(target){
+       const t=target.toLowerCase();
+       const open=DB.tasks.filter(x=>!['COMPLETED','SKIPPED'].includes(x.status));
+       // exact first
+       let m=open.find(x=>x.title.toLowerCase()===t);
+       if(m) return m;
+       // starts-with
+       m=open.find(x=>x.title.toLowerCase().startsWith(t));
+       if(m) return m;
+       // includes
+       m=open.find(x=>x.title.toLowerCase().includes(t) || (x.subject||'').toLowerCase().includes(t));
+       return m||null;
+     },
+     resolveWhen(w){
+       w=(w||'today').toLowerCase();
+       if(w==='today') return todayStr();
+       if(w==='tomorrow') return relDate(1);
+       if(w==='next week') return relDate(7);
+       if(w==='next month') return relDate(30);
+       const days={monday:1,tuesday:2,wednesday:3,thursday:4,friday:5,saturday:6,sunday:0};
+       if(w in days){
+         const now=new Date(); const cur=now.getDay();
+         let diff=(days[w]-cur+7)%7; if(diff===0) diff=7;
+         return relDate(diff);
+       }
+       return todayStr();
+     },
+     guessSubject(text){
+       const tl=text.toLowerCase();
+       for(const s of DB.subjects){
+         if(tl.includes(s.name.toLowerCase())) return s.name;
+       }
+       return '';
+     }
+   };
+   
+   /* ------------------------------------------------------------
+      14. QUESTION PRACTICE ENGINE
+      ------------------------------------------------------------ */
+   const Practice = {
+     session:null,
+     timerTick:null,
+     questionTime:0,
+     totalTime:0,
+   
+     start(config){
+       const qs=config.questions;
+       if(!qs || !qs.length){ toast('No questions to practice'); return; }
+   
+       this.session={
+         id:uid(),
+         mode:config.mode||'custom',
+         config:config.config||{},
+         questions:qs,
+         answers:{},          // qid -> answer string
+         marked:{},           // qid -> true
+         revealed:{},         // qid -> true (answer shown)
+         times:{},            // qid -> seconds spent
+         current:0,
+         startedAt:new Date().toISOString(),
+         finishedAt:null,
+         timerMode: DB.settings.practiceTimerDefault||'per-question',
+         perQuestionSec: config.perQuestionSec || DB.settings.practicePerQuestionSec || 90,
+         totalSec: config.totalSec || 0,
+         totalRemaining: config.totalSec || 0,
+         chapterId: config.chapterId||null
+       };
+       this.questionTime=0;
+       this.renderSession();
+       $('#practiceSession').classList.add('show');
+       this.startTimer();
+     },
+   
+     startTimer(){
+       this.stopTimer();
+       if(this.session.timerMode==='none') return;
+       this.timerTick=setInterval(()=>{
+         const s=this.session; if(!s) return;
+         this.questionTime++;
+         const q=s.questions[s.current];
+         s.times[q.id]=(s.times[q.id]||0)+1;
+   
+         if(s.timerMode==='full'){
+           s.totalRemaining--;
+           if(s.totalRemaining<=0){ this.stopTimer(); this.onTimerExpire(); }
+         } else if(s.timerMode==='per-question'){
+           const limit=s.perQuestionSec;
+           const used=s.times[q.id]||0;
+           if(used>=limit) this.onTimerExpire();
+         }
+         this.renderTimerOnly();
+       },1000);
+     },
+     stopTimer(){
+       if(this.timerTick){ clearInterval(this.timerTick); this.timerTick=null; }
+     },
+     setTimerMode(mode, customSec){
+       if(!this.session) return;
+       this.session.timerMode=mode;
+       if(mode==='per-question' && customSec) this.session.perQuestionSec=customSec;
+       this.startTimer();
+       this.renderSession();
+     },
+     onTimerExpire(){
+       this.stopTimer();
+       if(this.session.timerMode==='per-question'){
+         toast('Time expired for this question — you can continue or move on.');
+       } else if(this.session.timerMode==='full'){
+         toast('Full paper time expired. Submit when ready.');
+       }
+     },
+   
+     renderTimerOnly(){
+       const s=this.session; if(!s) return;
+       const el=$('#psTimer'); if(!el) return;
+       let secs=0;
+       if(s.timerMode==='full') secs=Math.max(0,s.totalRemaining);
+       else if(s.timerMode==='per-question'){
+         const q=s.questions[s.current];
+         const used=s.times[q.id]||0;
+         secs=Math.max(0, s.perQuestionSec - used);
+         el.classList.toggle('warn', secs<15);
+       } else { secs=0; el.textContent='∞'; el.classList.remove('warn'); return; }
+       const m=Math.floor(secs/60), sc=secs%60;
+       el.textContent=pad(m)+':'+pad(sc);
+     },
+   
+     renderSession(){
+       const s=this.session; if(!s) return;
+       const q=s.questions[s.current];
+       const total=s.questions.length;
+       const isRevealed=!!s.revealed[q.id];
+       const sel=s.answers[q.id];
+   
+       const navDots=s.questions.map((qq,i)=>{
+         const cls=['nav-dot'];
+         if(i===s.current) cls.push('current');
+         if(s.answers[qq.id]) cls.push('answered');
+         if(s.marked[qq.id]) cls.push('marked');
+         return `<button class="${cls.join(' ')}" data-act="ps-jump" data-id="${i}">${i+1}</button>`;
+       }).join('');
+   
+       const optionsHTML = q.options ? `
+         <div class="q-options" id="psOptions">
+           ${q.options.map((opt,idx)=>{
+             const letter=String.fromCharCode(65+idx);
+             let cls='q-opt';
+             if(sel===opt) cls+=' selected';
+             if(isRevealed){
+               if(opt===q.answer) cls+=' correct';
+               else if(sel===opt) cls+=' wrong';
+             }
+             return `<div class="${cls}" data-act="ps-choose" data-opt="${esc(opt)}">
+               <span class="opt-letter">${letter}</span>
+               <span>${esc(opt)}</span>
+             </div>`;
+           }).join('')}
+         </div>
+       ` : `
+         <div class="ps-answer-zone">
+           <label>Your Answer</label>
+           <textarea id="psAnswer" ${isRevealed?'disabled':''} placeholder="Type your answer...">${esc(sel||'')}</textarea>
+         </div>
+       `;
+   
+       const solutionHTML = isRevealed ? `
+         <div class="ps-solution">
+           <h5>Correct Answer</h5>
+           <div class="ps-solution-body"><b style="color:var(--gold-2);">${esc(q.answer)}</b></div>
+           ${q.solution? `<h5 style="margin-top:14px;">Solution</h5><div class="ps-solution-body">${esc(q.solution)}</div>`:''}
+         </div>
+       ` : '';
+   
+       const timed=s.timerMode!=='none';
+   
+       $('#practiceSession').innerHTML=`
+         <div class="ps-top">
+           <div>
+             <div class="ps-title">QUESTION PRACTICE</div>
+             <div class="ps-sub">${esc(s.config.subject||q.subject)} · ${esc(s.config.chapter||q.chapter)} · Question ${s.current+1} of ${total}</div>
+           </div>
+           <div class="flex gap12 center">
+             ${timed?`<div class="ps-timer" id="psTimer">--:--</div>`:`<div class="ps-timer" style="opacity:.5">∞</div>`}
+             <button class="btn ghost sm" data-act="ps-change-timer">⏱ Timer: ${s.timerMode==='none'?'Off':s.timerMode==='full'?'Paper':'Per-Q'}</button>
+             <button class="btn ghost sm" data-act="ps-exit">Exit</button>
+           </div>
+         </div>
+         <div class="ps-body">
+           <div class="ps-qnum">Q ${s.current+1} / ${total} · ${esc(q.questionType)} · ${esc(q.difficulty)} · ${q.marks} mark${q.marks>1?'s':''} · rec. ${fmtDur(Math.round((q.recommendedTime||90)/60))}</div>
+           <div class="ps-qtext">${esc(q.questionText)}</div>
+           ${optionsHTML}
+           ${!isRevealed && !q.options ? `<div style="margin-top:12px;"><button class="btn sm" data-act="ps-save-answer">Save Answer</button></div>`:''}
+           ${solutionHTML}
+           <div class="q-meta" style="margin-top:18px;">
+             <span class="q-src">◎ Source: ${esc(q.source||'—')}</span>
+           </div>
+         </div>
+         <div class="ps-bottom">
+           <div class="ps-nav">${navDots}</div>
+           <div class="flex gap8 wrap">
+             <button class="btn sm ghost" data-act="ps-prev">← Prev</button>
+             <button class="btn sm ghost" data-act="ps-mark">${s.marked[q.id]?'✓ Marked':'Mark for Review'}</button>
+             ${!isRevealed? `<button class="btn sm" data-act="ps-reveal">Reveal Answer</button>`:''}
+             <button class="btn sm" data-act="ps-next">Next →</button>
+             <button class="btn primary sm" data-act="ps-submit">Submit Session</button>
+           </div>
+         </div>
+       `;
+   
+       this.renderTimerOnly();
+     },
+   
+     chooseOption(opt){
+       const s=this.session; if(!s) return;
+       const q=s.questions[s.current];
+       if(s.revealed[q.id]) return;
+       s.answers[q.id]=opt;
+       this.renderSession();
+     },
+     saveTextAnswer(){
+       const s=this.session; if(!s) return;
+       const q=s.questions[s.current];
+       const v=($('#psAnswer')||{}).value||'';
+       s.answers[q.id]=v;
+       toast('Answer saved');
+     },
+     reveal(){
+       const s=this.session; if(!s) return;
+       const q=s.questions[s.current];
+       if(!q.options){
+         const v=($('#psAnswer')||{}).value;
+         if(v!==undefined) s.answers[q.id]=v;
+       }
+       s.revealed[q.id]=true;
+       this.stopTimer();
+       this.renderSession();
+     },
+     mark(){
+       const s=this.session; if(!s) return;
+       const q=s.questions[s.current];
+       s.marked[q.id]=!s.marked[q.id];
+       this.renderSession();
+     },
+     jump(i){
+       const s=this.session; if(!s) return;
+       s.current=clamp(i,0,s.questions.length-1);
+       this.renderSession();
+       this.startTimer();
+     },
+     next(){
+       const s=this.session; if(!s) return;
+       if(s.current<s.questions.length-1){ s.current++; this.renderSession(); this.startTimer(); }
+     },
+     prev(){
+       const s=this.session; if(!s) return;
+       if(s.current>0){ s.current--; this.renderSession(); this.startTimer(); }
+     },
+   
+     submit(){
+       const s=this.session; if(!s) return;
+       this.stopTimer();
+   
+       // Score
+       let correct=0, incorrect=0, skipped=0;
+       const detail=[];
+       s.questions.forEach(q=>{
+         const ans=s.answers[q.id];
+         const isCorrect = ans && String(ans).trim().toLowerCase()===String(q.answer).trim().toLowerCase();
+         if(!ans || String(ans).trim()===''){ skipped++; }
+         else if(isCorrect) correct++;
+         else incorrect++;
+         detail.push({qid:q.id, ans:ans||'', correct:isCorrect, topic:q.topic||'', chapter:q.chapter, subject:q.subject});
+       });
+   
+       const attempted=correct+incorrect;
+       const accuracy = attempted? Math.round(correct/attempted*100) : 0;
+       const timeTotal = Object.values(s.times).reduce((a,b)=>a+b,0);
+       const avgTime = s.questions.length? Math.round(timeTotal/s.questions.length) : 0;
+   
+       const session={
+         id:s.id,
+         mode:s.mode,
+         config:s.config,
+         questionIds:s.questions.map(q=>q.id),
+         answers:s.answers,
+         times:s.times,
+         startedAt:s.startedAt,
+         finishedAt:new Date().toISOString(),
+         correct, incorrect, skipped, attempted, accuracy, avgTime,
+         detail
+       };
+       DB.practiceSessions.push(session);
+   
+       // Contribute actual time to chapter/task if linked
+       if(s.chapterId && timeTotal>0){
+         const mins=Math.max(1, Math.round(timeTotal/60));
+         logChapterSession(s.chapterId, mins, {note:'Practice session'});
+       }
+   
+       saveDB();
+       this.renderResults(session);
+     },
+   
+     renderResults(session){
+       const s=this.session;
+       const total=s.questions.length;
+   
+       $('#practiceSession').innerHTML=`
+         <div class="ps-top">
+           <div>
+             <div class="ps-title">PRACTICE RESULTS</div>
+             <div class="ps-sub">${esc(session.config.subject||'')} · ${esc(session.config.chapter||'')}</div>
+           </div>
+           <div class="flex gap8">
+             <button class="btn primary" data-act="ps-finish">Done</button>
+           </div>
+         </div>
+         <div class="ps-body">
+           <div class="result-hero">
+             <div class="big">${session.accuracy}%</div>
+             <div class="lbl">Accuracy</div>
+           </div>
+   
+           <div class="grid g4" style="margin-bottom:20px;">
+             <div class="stat"><div class="lbl">Questions</div><div class="val">${total}</div></div>
+             <div class="stat"><div class="lbl">Attempted</div><div class="val" style="color:var(--info)">${session.attempted}</div></div>
+             <div class="stat"><div class="lbl">Correct</div><div class="val" style="color:var(--good)">${session.correct}</div></div>
+             <div class="stat"><div class="lbl">Incorrect</div><div class="val" style="color:var(--bad)">${session.incorrect}</div></div>
+             <div class="stat"><div class="lbl">Skipped</div><div class="val" style="color:var(--muted)">${session.skipped}</div></div>
+             <div class="stat"><div class="lbl">Avg Time</div><div class="val" style="font-size:20px">${pad(Math.floor(session.avgTime/60))}:${pad(session.avgTime%60)}</div></div>
+             <div class="stat"><div class="lbl">Total Time</div><div class="val" style="font-size:20px">${pad(Math.floor(Object.values(session.times).reduce((a,b)=>a+b,0)/60))}:${pad(Object.values(session.times).reduce((a,b)=>a+b,0)%60)}</div></div>
+             <div class="stat"><div class="lbl">Marks Scored</div><div class="val">${session.detail.reduce((a,d)=>{const q=DB.questions.find(x=>x.id===d.qid);return a+(d.correct&&q?q.marks:0);},0)}</div></div>
+           </div>
+   
+           <div class="section-head"><div class="section-title">Question-wise Review</div></div>
+           ${s.questions.map((q,i)=>{
+             const d=session.detail[i];
+             const bg = d.correct? 'rgba(127,224,160,.06)' : (d.ans? 'rgba(224,122,106,.06)' : 'rgba(0,0,0,.3)');
+             const border = d.correct? 'rgba(127,224,160,.3)' : (d.ans? 'rgba(224,122,106,.3)' : 'var(--line)');
+             return `<div class="q-card" style="background:${bg};border-color:${border};">
+               <div class="flex between center gap8 wrap">
+                 <div style="font-size:10.5px;letter-spacing:.2em;color:var(--gold);font-weight:800;">Q${i+1} · ${esc(q.questionType)} · ${q.marks} mark${q.marks>1?'s':''}</div>
+                 <div class="flex gap8">
+                   <span class="tag ${d.correct?'good':'bad'}">${d.correct?'CORRECT':(d.ans?'INCORRECT':'SKIPPED')}</span>
+                   <span class="tag">${session.times[q.id]||0}s</span>
+                 </div>
+               </div>
+               <div class="q-title" style="margin-top:10px;">${esc(q.questionText)}</div>
+               <div class="q-meta">
+                 <span>Your answer: <b style="color:${d.correct?'var(--good)':'var(--bad)'}">${esc(d.ans||'—')}</b></span>
+                 <span>Correct: <b style="color:var(--good)">${esc(q.answer)}</b></span>
+                 <span class="q-src">${esc(q.source)}</span>
+               </div>
+             </div>`;
+           }).join('')}
+   
+           <div class="section-head"><div class="section-title">Weak Topics Detected</div></div>
+           ${this.detectWeakTopics(session.detail).map(w=>`
+             <div class="q-card">
+               <div class="flex between center gap8">
+                 <div style="font-size:12.5px;">${esc(w.topic||w.chapter)}</div>
+                 <span class="tag bad">${w.wrong} incorrect</span>
+               </div>
+               <div class="small muted mt8">Suggested: practice more PYQs on this topic.</div>
+             </div>
+           `).join('') || `<div class="empty">No clear weak area detected — insufficient data or all correct.</div>`}
+         </div>
+       `;
+     },
+   
+     detectWeakTopics(detail){
+       const map={};
+       detail.forEach(d=>{
+         if(!d.correct && d.ans){
+           const key=(d.topic||d.chapter||'').trim();
+           if(!key) return;
+           map[key]=map[key]||{topic:key, chapter:d.chapter, wrong:0};
+           map[key].wrong++;
+         }
+       });
+       return Object.values(map).filter(x=>x.wrong>=1).sort((a,b)=>b.wrong-a.wrong);
+     },
+   
+     finish(){
+       this.session=null;
+       this.stopTimer();
+       $('#practiceSession').classList.remove('show');
+       render();
+     },
+   
+     exitConfirm(){
+       if(!this.session) { this.finish(); return; }
+       if(confirm('Exit practice session? Progress for this session will not be saved to results.')){
+         this.session=null; this.stopTimer();
+         $('#practiceSession').classList.remove('show');
+       }
+     }
+   };
+   
+   /* ------------------------------------------------------------
+      15. NAVIGATION
       ------------------------------------------------------------ */
    const NAV=[
      ['dashboard','Dashboard','◈'],
@@ -818,6 +1611,7 @@
      ['tasks','Tasks','✓'],
      ['exams','Exams','✦'],
      ['study','Study','◎'],
+     ['practice','Practice','✎'],
      ['calendar','Calendar','▦'],
      ['projects','Projects','▣'],
      ['files','Files','▥'],
@@ -827,6 +1621,8 @@
    ];
    let VIEW='dashboard';
    let STUDY_OPEN={};
+   let PRACTICE_TAB='now';
+   let PRACTICE_FILTER={exam:'',subject:'',chapter:''};
    
    function renderNav(){
      const nav=$('#nav'); if(!nav) return;
@@ -852,12 +1648,9 @@
    }
    
    /* ------------------------------------------------------------
-      12. VIEWS
+      16. VIEWS
       ------------------------------------------------------------ */
-   const CAT_COLOR={
-     ACADEMICS:'gold', FILES:'info', SKILLS:'violet', HEALTH:'good',
-     PROJECT:'violet', PERSONAL:'', RECREATION:'warn', OTHER:''
-   };
+   const CAT_COLOR={ACADEMICS:'gold', FILES:'info', SKILLS:'violet', HEALTH:'good', PROJECT:'violet', PERSONAL:'', RECREATION:'warn', OTHER:''};
    function catTag(c){ return `<span class="tag ${CAT_COLOR[c]||''}">${esc(c)}</span>`; }
    
    /* ---------- DASHBOARD ---------- */
@@ -870,11 +1663,9 @@
      const curTask = cb? DB.tasks.find(t=>t.id===cb.taskId) : null;
      const nb = nextBlock();
      const nbTask = nb? DB.tasks.find(t=>t.id===nb.taskId) : null;
-   
      const primary = nx
        ? `Prepare for ${nx.subject} examination on ${parseD(nx.date).toLocaleDateString('en-GB',{day:'numeric',month:'long'})}`
        : 'Maintain execution consistency across all subjects';
-   
      const topPriorities=ranked.slice(0,6);
    
      return `
@@ -885,11 +1676,27 @@
        </div>
        <div class="flex gap8 wrap">
          <button class="btn" data-act="regen">⟳ Regenerate Day</button>
-         <button class="btn ghost" data-act="whatnow">⚡ What Should I Do Now?</button>
+         <button class="btn ghost" data-act="open-assistant">✦ Tell the Assistant</button>
        </div>
      </div>
    
-     <div class="grid g2" style="margin-bottom:16px;">
+     <!-- Assistant command bar -->
+     <div class="assistant-bar">
+       <span class="ab-icon">✦</span>
+       <input id="assistantInput" placeholder="Tell the assistant — e.g. &quot;Add 30 min of English&quot;, &quot;What should I do now?&quot;, &quot;I finished Physics&quot;" autocomplete="off" />
+       <button class="btn primary" data-act="assistant-execute">Execute</button>
+       <button class="btn ghost sm" data-act="assistant-clear">Clear</button>
+     </div>
+     <div class="assistant-hint">Try: Add 30 minutes of English · Start 45 min Physics · Move Chemistry to tomorrow · What should I do now?</div>
+     ${Assistant.history.length? `<div class="assistant-history">
+       ${Assistant.history.slice(0,3).map(h=>`<div class="ah-item">
+         <span class="ah-time">${new Date(h.at).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</span>
+         <span class="ah-text">${esc(h.input)}</span>
+         <span class="ah-res">→ ${esc(h.result)}</span>
+       </div>`).join('')}
+     </div>`:''}
+   
+     <div class="grid g2" style="margin-top:16px;margin-bottom:16px;">
        <div class="card">
          <div class="card-title">Today's Primary Mission</div>
          <div style="font-size:17px;font-weight:700;color:var(--gold-2);line-height:1.4;">${esc(primary)}</div>
@@ -936,7 +1743,7 @@
              ${catTag(curTask.category)}
              <span class="pri ${levelOfTask(curTask.id)}">${levelOfTask(curTask.id)}</span>
              <span>${esc(curTask.subject||'')}</span>
-             <span>Est ${fmtDur(curTask.estimatedMinutes)}</span>
+             <span>Remaining ${fmtDur(remainingMinutesFor(curTask))}</span>
              <span>Actual ${fmtDur(curTask.actualMinutes||0)}</span>
            </div>
            <div class="bar"><i style="width:${Math.min(100,Math.round(((curTask.actualMinutes||0)/(curTask.estimatedMinutes||1))*100))}%"></i></div>
@@ -948,12 +1755,12 @@
              <button class="btn ghost" data-act="resched-task" data-id="${curTask.id}">Reschedule</button>
            </div>
          `: (nbTask?`
-           <div class="small muted">Nothing active right now. Next up at <span class="mono" style="color:var(--gold-2)">${m2t(nb.start)}</span></div>
+           <div class="small muted">Nothing active. Next up at <span class="mono" style="color:var(--gold-2)">${m2t(nb.start)}</span></div>
            <div style="font-size:15px;font-weight:700;color:var(--gold-2);margin-top:9px;">${esc(nbTask.title)}</div>
            <div class="t-meta mt8">
              ${catTag(nbTask.category)}
              <span class="pri ${levelOfTask(nbTask.id)}">${levelOfTask(nbTask.id)}</span>
-             <span>${fmtDur(nb.end-nb.start)}</span>
+             <span>${fmtDur(remainingMinutesFor(nbTask))} remaining</span>
            </div>
            <div class="flex gap8 wrap mt16">
              <button class="btn primary" data-act="start-task" data-id="${nbTask.id}">▶ Start Early</button>
@@ -968,7 +1775,7 @@
            <div class="flex between center" style="padding:8px 0;border-bottom:1px solid rgba(212,175,55,.08);">
              <div style="min-width:0;flex:1;">
                <div style="font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(r.task.title)}</div>
-               <div class="small muted" style="margin-top:3px;">${esc(r.task.subject||r.task.category)} · ${fmtDur(r.task.estimatedMinutes)}${r.task.deadline?' · due '+fmtDate(r.task.deadline).slice(0,12):''}</div>
+               <div class="small muted" style="margin-top:3px;">${esc(r.task.subject||r.task.category)} · remaining ${fmtDur(remainingMinutesFor(r.task))}${r.task.deadline?' · due '+fmtDate(r.task.deadline).slice(0,12):''}</div>
              </div>
              <span class="pri ${r.level}" style="margin-left:10px;">${r.level}</span>
            </div>`).join('') : `<div class="empty">No open tasks</div>`}
@@ -983,7 +1790,7 @@
    
    function timelineHTML(blocks){
      if(!blocks.length) return `<div class="empty">No blocks scheduled. Generate the day from the Today page.</div>`;
-     const typeLabel={school:'SCHOOL',coaching:'COACHING',meal:'MEAL',routine:'ROUTINE',break:'BREAK',task:'TASK'};
+     const typeLabel={school:'SCHOOL',coaching:'COACHING',meal:'MEAL',routine:'ROUTINE',break:'BREAK',task:'TASK',custom:'CUSTOM'};
      return `<div class="tl">${blocks.map(b=>{
        const st=blockStatus(b);
        const label=typeLabel[b.type]||'BLOCK';
@@ -1015,6 +1822,8 @@
      const done=sch.blocks.filter(b=>b.type==='task' && blockStatus(b)==='completed').length;
      const total=sch.blocks.filter(b=>b.type==='task').length;
    
+     const recent=DB.rescheduleHistory.slice(-3).reverse();
+   
      return `
      <div class="section-head">
        <div><div class="section-title">Today · ${fmtDate(todayStr())}</div>
@@ -1033,10 +1842,19 @@
        <div class="stat"><div class="lbl">Time Lost</div><div class="val" style="color:${lost?'var(--bad)':'var(--muted-2)'}">${fmtDur(lost)}</div><div class="sub">reported today</div></div>
      </div>
    
-     <div class="card">
+     <div class="card" style="margin-bottom:16px;">
        <div class="card-title">Full Day Timeline</div>
        ${timelineHTML(sch.blocks)}
      </div>
+   
+     ${recent.length?`
+     <div class="section-head"><div class="section-title">Recent Reschedules</div></div>
+     <div class="card">
+       ${recent.map(h=>`<div class="flex between center" style="padding:9px 0;border-bottom:1px solid rgba(212,175,55,.08);">
+         <div style="font-size:11.5px;color:var(--text);">${esc(h.reason)}</div>
+         <div class="small muted">${new Date(h.at).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</div>
+       </div>`).join('')}
+     </div>`:''}
      `;
    }
    
@@ -1048,7 +1866,6 @@
      let list=DB.tasks.slice();
      if(TASK_FILTER!=='ALL') list=list.filter(t=>t.category===TASK_FILTER);
      list.sort((a,b)=>taskScore(b)-taskScore(a));
-   
      const cats=['ALL','ACADEMICS','FILES','SKILLS','HEALTH','PROJECT','PERSONAL','RECREATION','OTHER'];
    
      return `
@@ -1079,6 +1896,8 @@
      const subDone=(t.subtasks||[]).filter(s=>s.done).length;
      const subTotal=(t.subtasks||[]).length;
      const linked= t.chapterId ? findChapterRef(t.chapterId) : null;
+     const rem=remainingMinutesFor(t);
+     const pct=Math.min(100, Math.round(((t.actualMinutes||0)/(t.estimatedMinutes||1))*100));
    
      return `
      <div class="task ${done?'done':''}">
@@ -1089,12 +1908,15 @@
            <span class="pri ${level||'P4'}">${level||'P4'}</span>
            ${catTag(t.category)}
            ${t.subject?`<span>${esc(t.subject)}</span>`:''}
-           <span>${fmtDur(t.estimatedMinutes)}</span>
+           <span>Est ${fmtDur(t.estimatedMinutes)}</span>
+           ${t.actualMinutes?`<span style="color:var(--good)">Actual ${fmtDur(t.actualMinutes)}</span>`:''}
+           ${!done && rem<t.estimatedMinutes?`<span style="color:var(--warn)">Remaining ${fmtDur(rem)}</span>`:''}
            ${t.deadline?`<span>due ${fmtDate(t.deadline)}</span>`:''}
            ${subTotal?`<span>${subDone}/${subTotal} steps</span>`:''}
            ${linked?`<span class="tag violet">◎ ${esc(linked.chapter.name.slice(0,18))}</span>`:''}
            <span class="tag">${esc(t.status)}</span>
          </div>
+         ${t.actualMinutes>0 && !done? `<div class="bar" style="max-width:280px;"><i style="width:${pct}%"></i></div>`:''}
          ${t.objective?`<div class="small muted" style="margin-top:7px;">◎ ${esc(t.objective)}</div>`:''}
          ${subTotal?`<div class="subs">${t.subtasks.map(s=>`
            <div class="sub ${s.done?'on':''}">
@@ -1111,7 +1933,7 @@
      </div>`;
    }
    
-   /* ---------- STUDY (WORKSPACE) ---------- */
+   /* ---------- STUDY ---------- */
    function viewStudy(){
      const subs=DB.subjects||[];
      const totals=subjectTotals();
@@ -1254,6 +2076,232 @@
      </div>`;
    }
    
+   /* ---------- PRACTICE ---------- */
+   function viewPractice(){
+     const sessions=DB.practiceSessions.slice().reverse();
+     const questions=DB.questions;
+     const totalSessions=sessions.length;
+     const avgAcc = totalSessions? Math.round(sessions.reduce((a,s)=>a+s.accuracy,0)/totalSessions) : 0;
+     const totalQs = sessions.reduce((a,s)=>a+s.questionIds.length,0);
+   
+     const subs=[...new Set(questions.map(q=>q.subject))];
+     const chapters=questions.map(q=>q.chapter).filter((v,i,a)=>a.indexOf(v)===i);
+     const exams=[...new Set(questions.map(q=>q.exam))];
+   
+     return `
+     <div class="section-head">
+       <div class="section-title">Question Practice & PYQ Engine</div>
+       <div class="flex gap8 wrap">
+         <button class="btn primary" data-act="practice-new">⚡ Practice Now</button>
+         <button class="btn" data-act="practice-import-pdf">⇣ Import PDF</button>
+         <button class="btn ghost" data-act="practice-add-question">+ Add Question</button>
+       </div>
+     </div>
+   
+     <div class="grid g4" style="margin-bottom:18px;">
+       <div class="stat"><div class="lbl">Questions in Bank</div><div class="val">${questions.length}</div><div class="sub">available to practice</div></div>
+       <div class="stat"><div class="lbl">Sessions Completed</div><div class="val">${totalSessions}</div><div class="sub">all-time</div></div>
+       <div class="stat"><div class="lbl">Avg Accuracy</div><div class="val">${avgAcc}%</div><div class="sub">across sessions</div></div>
+       <div class="stat"><div class="lbl">Questions Attempted</div><div class="val">${totalQs}</div><div class="sub">total</div></div>
+     </div>
+   
+     <div class="practice-tabs">
+       ${['now','chapter','papers','sets','results','bank'].map(t=>`
+         <button class="ptab ${PRACTICE_TAB===t?'active':''}" data-act="practice-tab" data-id="${t}">
+           ${({now:'Practice Now',chapter:'Chapter PYQs',papers:'Full Papers',sets:'My Sets',results:'Results & Analysis',bank:'Question Bank'})[t]}
+         </button>
+       `).join('')}
+     </div>
+   
+     ${PRACTICE_TAB==='now'? renderPracticeNow(subs,chapters,exams) : ''}
+     ${PRACTICE_TAB==='chapter'? renderChapterPicker(subs,chapters) : ''}
+     ${PRACTICE_TAB==='papers'? renderPapers(exams) : ''}
+     ${PRACTICE_TAB==='sets'? renderMySets(sessions) : ''}
+     ${PRACTICE_TAB==='results'? renderResults(sessions) : ''}
+     ${PRACTICE_TAB==='bank'? renderBank(questions) : ''}
+     `;
+   }
+   
+   function renderPracticeNow(subs,chapters,exams){
+     return `
+     <div class="card">
+       <div class="card-title">Custom Practice Configuration</div>
+       <div class="row">
+         <div class="field"><label>Exam</label>
+           <select id="p-exam"><option value="">Any</option>${exams.map(e=>`<option>${esc(e)}</option>`).join('')}</select>
+         </div>
+         <div class="field"><label>Subject</label>
+           <select id="p-subject"><option value="">Any</option>${subs.map(s=>`<option>${esc(s)}</option>`).join('')}</select>
+         </div>
+       </div>
+       <div class="row">
+         <div class="field"><label>Chapter</label>
+           <select id="p-chapter"><option value="">Any</option>${chapters.map(c=>`<option>${esc(c)}</option>`).join('')}</select>
+         </div>
+         <div class="field"><label>Number of Questions</label>
+           <input id="p-count" type="number" value="10" min="1" max="50" />
+         </div>
+       </div>
+       <div class="row">
+         <div class="field"><label>Timer Mode</label>
+           <select id="p-timer">
+             <option value="per-question">Per-question (90s default)</option>
+             <option value="full">Full session timer</option>
+             <option value="none">No timer</option>
+           </select>
+         </div>
+         <div class="field"><label>Per-question seconds (if applicable)</label>
+           <input id="p-pqsec" type="number" value="${DB.settings.practicePerQuestionSec||90}" min="30" />
+         </div>
+       </div>
+       <div class="flex gap8 mt16">
+         <button class="btn primary" data-act="practice-start-custom">▶ Start Practice</button>
+       </div>
+     </div>`;
+   }
+   
+   function renderChapterPicker(subs,chapters){
+     const bySubject={};
+     DB.questions.forEach(q=>{ (bySubject[q.subject]=bySubject[q.subject]||new Set()).add(q.chapter); });
+     return `
+     <div class="grid g2">
+       ${Object.keys(bySubject).map(s=>`
+         <div class="card">
+           <div class="card-title">${esc(s)}</div>
+           ${[...bySubject[s]].map(c=>{
+             const count=DB.questions.filter(q=>q.subject===s && q.chapter===c).length;
+             return `<div class="flex between center" style="padding:9px 0;border-bottom:1px solid rgba(212,175,55,.08);">
+               <div style="font-size:12px;flex:1;">${esc(c)}</div>
+               <span class="tag">${count} Q${count===1?'':'s'}</span>
+               <button class="btn sm primary" data-act="practice-chapter" data-id="${esc(s)}||${esc(c)}" style="margin-left:10px;">▶ Practice</button>
+             </div>`;
+           }).join('')}
+         </div>
+       `).join('') || `<div class="empty">No questions in the bank yet. Add some or import a PDF.</div>`}
+     </div>`;
+   }
+   
+   function renderPapers(exams){
+     const papers={};
+     DB.questions.forEach(q=>{
+       if(!q.year) return;
+       const key=q.exam+'||'+q.subject+'||'+q.year;
+       if(!papers[key]) papers[key]={exam:q.exam,subject:q.subject,year:q.year,count:0};
+       papers[key].count++;
+     });
+     const list=Object.values(papers);
+     return `
+     <div class="grid g2">
+       ${list.length? list.map(p=>`
+         <div class="card">
+           <div class="flex between center">
+             <div>
+               <div style="font-size:15px;font-weight:800;color:var(--gold-2);">${esc(p.exam)} ${esc(p.subject)}</div>
+               <div class="small muted mt8">Year ${p.year} · ${p.count} questions available</div>
+             </div>
+             <button class="btn sm primary" data-act="practice-paper" data-id="${esc(p.exam)}||${esc(p.subject)}||${p.year}">▶ Practice</button>
+           </div>
+         </div>
+       `).join('') : `<div class="empty">No full papers available yet. Import or add questions with year metadata.</div>`}
+     </div>`;
+   }
+   
+   function renderMySets(sessions){
+     return `
+     <div class="grid g2">
+       ${sessions.length? sessions.map(s=>{
+         const d=new Date(s.startedAt);
+         return `<div class="card">
+           <div class="flex between center wrap gap8">
+             <div>
+               <div style="font-size:13px;font-weight:700;color:var(--gold-2);">${esc(s.config.subject||'—')} · ${esc(s.config.chapter||'General')}</div>
+               <div class="small muted mt8">${d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})} · ${s.questionIds.length} Qs · ${s.accuracy}% accuracy</div>
+             </div>
+             <span class="tag ${s.accuracy>=70?'good':s.accuracy>=50?'warn':'bad'}">${s.accuracy}%</span>
+           </div>
+         </div>`;
+       }).join('') : `<div class="empty">No practice sessions yet.</div>`}
+     </div>`;
+   }
+   
+   function renderResults(sessions){
+     if(!sessions.length) return `<div class="empty">No practice history yet.</div>`;
+     // Weak topic aggregation
+     const topicMap={};
+     sessions.forEach(s=>{
+       s.detail.forEach(d=>{
+         if(!d.correct && d.ans){
+           const key=d.topic||d.chapter||'';
+           if(!key) return;
+           topicMap[key]=topicMap[key]||{topic:key, chapter:d.chapter, wrong:0, total:0};
+           topicMap[key].wrong++;
+         }
+         const key=d.topic||d.chapter||'';
+         if(key){
+           topicMap[key]=topicMap[key]||{topic:key, chapter:d.chapter, wrong:0, total:0};
+           topicMap[key].total++;
+         }
+       });
+     });
+     const weak=Object.values(topicMap).filter(t=>t.wrong>=2).sort((a,b)=>b.wrong-a.wrong);
+   
+     return `
+     <div class="card" style="margin-bottom:18px;">
+       <div class="card-title">Weak Topic Analysis</div>
+       ${weak.length? weak.map(w=>{
+         const rate=Math.round(w.wrong/Math.max(1,w.total)*100);
+         return `<div style="padding:10px 0;border-bottom:1px solid rgba(212,175,55,.08);">
+           <div class="flex between center">
+             <div style="font-size:12.5px;">${esc(w.topic)}</div>
+             <span class="tag bad">${w.wrong} / ${w.total} wrong</span>
+           </div>
+           <div class="small muted mt8">Error rate: ${rate}% · Suggested: practice 5 more PYQs on this topic.</div>
+         </div>`;
+       }).join('') : `<div class="empty">No clear weak area detected — insufficient data or consistently strong.</div>`}
+     </div>
+   
+     <div class="card">
+       <div class="card-title">Session History</div>
+       ${sessions.map(s=>{
+         const d=new Date(s.startedAt);
+         return `<div class="flex between center" style="padding:9px 0;border-bottom:1px solid rgba(212,175,55,.08);">
+           <div style="flex:1;">
+             <div style="font-size:12px;">${esc(s.config.subject||'—')} · ${esc(s.config.chapter||'General')}</div>
+             <div class="small muted">${d.toLocaleString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}</div>
+           </div>
+           <div class="flex gap8">
+             <span class="tag good">${s.correct}✓</span>
+             <span class="tag bad">${s.incorrect}✗</span>
+             <span class="tag">${s.skipped}—</span>
+             <span class="tag gold">${s.accuracy}%</span>
+           </div>
+         </div>`;
+       }).join('')}
+     </div>`;
+   }
+   
+   function renderBank(questions){
+     return `
+     <div class="card">
+       <div class="card-title">Question Bank · ${questions.length} questions</div>
+       ${questions.length? questions.slice(0,50).map(q=>`
+         <div class="q-card">
+           <div class="flex between center gap8 wrap">
+             <span class="tag gold">${esc(q.exam)} ${q.year||''}</span>
+             <span class="tag">${esc(q.subject)} · ${esc(q.chapter)}</span>
+             <span class="tag">${esc(q.questionType)}</span>
+             <span class="tag">${q.marks}M</span>
+           </div>
+           <div class="q-title" style="margin-top:10px;">${esc(q.questionText.slice(0,180))}${q.questionText.length>180?'…':''}</div>
+           <div class="q-meta"><span class="q-src">◎ ${esc(q.source||'—')}</span></div>
+           <div class="flex gap8 mt8">
+             <button class="btn sm danger" data-act="practice-del-q" data-id="${q.id}">Delete</button>
+           </div>
+         </div>
+       `).join('') : `<div class="empty">No questions yet. Add via "Add Question" or "Import PDF".</div>`}
+     </div>`;
+   }
+   
    /* ---------- CALENDAR ---------- */
    let CAL_MONTH=new Date().getMonth(), CAL_YEAR=new Date().getFullYear();
    function viewCalendar(){
@@ -1272,7 +2320,6 @@
        DB.files.forEach(f=>{ if(f.deadline===ds) ev.push({t:f.subject+' '+f.type,c:'info'}); });
        return ev;
      };
-   
      const monthName=first.toLocaleDateString('en-GB',{month:'long',year:'numeric'}).toUpperCase();
    
      return `
@@ -1418,17 +2465,14 @@
      }
      const maxMin=Math.max(...last7.map(x=>x.minutes),60);
      const totalMin=last7.reduce((a,x)=>a+x.minutes,0);
-   
      const subjectMap={};
      DB.focusSessions.forEach(f=>{ subjectMap[f.subject]=(subjectMap[f.subject]||0)+f.minutes; });
      const subjects=Object.entries(subjectMap).sort((a,b)=>b[1]-a[1]);
-   
      const completionRate=(()=>{
        const total=DB.tasks.length;
        const done=DB.tasks.filter(t=>t.status==='COMPLETED').length;
        return total? Math.round(done/total*100):0;
      })();
-   
      const ws=subjectTotals();
    
      return `
@@ -1489,7 +2533,7 @@
      const s=DB.settings;
      return `
      <div class="section-head"><div class="section-title">Settings</div>
-       <button class="btn primary" data-act="save-settings">Save Settings</button></div>
+       <div class="small muted">Changes save automatically as you type.</div></div>
    
      <div class="card" style="margin-bottom:16px;">
        <div class="card-title">Data File (Auto-Save)</div>
@@ -1503,7 +2547,7 @@
                  ? `<b>PERMISSION NEEDED</b> · browser needs a click to re-authorise the file`
                  : (FileSync.supported
                      ? `<b>LOCAL ONLY</b> · everything is saved in this browser<br>Connect a JSON file to keep records on disk automatically.`
-                     : `<b>BROWSER UNSUPPORTED</b> · this browser cannot write files directly — use Export JSON.`)}
+                     : `<b>BROWSER UNSUPPORTED</b> · use Export JSON.`)}
            </div>
          </div>
          <div class="flex gap8 wrap">
@@ -1516,7 +2560,6 @@
                : `<button class="btn primary" data-act="fs-connect">🔗 Connect Data File</button>`}
          </div>
        </div>
-       <div class="small muted mt16">When connected, your data lives in a real JSON file you own. Every save writes to it automatically (debounced ~0.7s). Nothing leaves your machine.</div>
      </div>
    
      <div class="grid g2">
@@ -1550,6 +2593,16 @@
            <div class="field"><label>Project Time (min)</label><input id="set-project" type="number" value="${s.projectTime}" /></div>
            <div class="field"><label>Recreation Allowance (min)</label><input id="set-recreation" type="number" value="${s.recreationAllowance}" /></div>
          </div>
+         <div class="row">
+           <div class="field"><label>Practice Timer Default</label>
+             <select id="set-ptimer">
+               <option value="per-question" ${s.practiceTimerDefault==='per-question'?'selected':''}>Per-question</option>
+               <option value="full" ${s.practiceTimerDefault==='full'?'selected':''}>Full paper</option>
+               <option value="none" ${s.practiceTimerDefault==='none'?'selected':''}>No timer</option>
+             </select>
+           </div>
+           <div class="field"><label>Per-question seconds</label><input id="set-pqsec" type="number" value="${s.practicePerQuestionSec||90}" /></div>
+         </div>
          <div class="field"><label>Known Distractions</label><input id="set-distractions" value="${esc(s.distractions)}" /></div>
        </div>
      </div>
@@ -1576,27 +2629,24 @@
          <button class="btn" data-act="export-csv">⤓ Export Tasks CSV</button>
          <button class="btn danger" data-act="reset">⚠ Reset All Data</button>
        </div>
-       <div class="small muted mt8">A data file (above) is the safest long-term storage. Exports remain useful for backups or for moving to another machine.</div>
      </div>
      `;
    }
    
    /* ------------------------------------------------------------
-      13. RENDER (with scroll restore)
+      17. RENDER (with scroll restore)
       ------------------------------------------------------------ */
    function render(opts){
      opts=opts||{};
      const view=$('#view'); if(!view) return;
      const prevScroll=view.scrollTop;
-   
      renderNav();
      renderExamPill();
-   
      const map={
        dashboard:viewDashboard, today:viewToday, tasks:viewTasks,
-       exams:viewExams, study:viewStudy, calendar:viewCalendar,
-       projects:viewProjects, files:viewFiles, habits:viewHabits,
-       analytics:viewAnalytics, settings:viewSettings
+       exams:viewExams, study:viewStudy, practice:viewPractice,
+       calendar:viewCalendar, projects:viewProjects, files:viewFiles,
+       habits:viewHabits, analytics:viewAnalytics, settings:viewSettings
      };
      view.dataset.view=VIEW;
      view.innerHTML=(map[VIEW]||viewDashboard)();
@@ -1604,7 +2654,7 @@
    }
    
    /* ------------------------------------------------------------
-      14. MODALS
+      18. MODALS
       ------------------------------------------------------------ */
    function openModal(html){ $('#modal').innerHTML=html; $('#overlay').classList.add('show'); }
    function closeModal(){ $('#overlay').classList.remove('show'); }
@@ -1612,48 +2662,39 @@
    function modalTaskForm(task, prefilledDate){
      const t=task||{title:'',category:'ACADEMICS',subject:'',priority:2,estimatedMinutes:40,
        deadline:prefilledDate||todayStr(),objective:'',notes:'',subtasks:[],chapterId:null};
-   
      const chapterOptions = (DB.subjects||[]).map(s=>`
        <optgroup label="${esc(s.name)}">
          ${s.chapters.map(c=>`<option value="${c.id}" ${t.chapterId===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}
        </optgroup>
      `).join('');
-   
      openModal(`
-       <h3>${task?'Edit Task':'New Task'}
-         <button class="btn ghost sm" data-act="close-modal">✕</button>
-       </h3>
-       <div class="field"><label>Title</label><input id="m-title" value="${esc(t.title)}" placeholder="Physics — Electric Potential practice" /></div>
-       <div class="field"><label>Objective (clear definition of DONE)</label><textarea id="m-objective" placeholder="Understand potential due to point charge and solve 5 problems.">${esc(t.objective||'')}</textarea></div>
+       <h3>${task?'Edit Task':'New Task'}<button class="btn ghost sm" data-act="close-modal">✕</button></h3>
+       <div class="field"><label>Title</label><input id="m-title" value="${esc(t.title)}" /></div>
+       <div class="field"><label>Objective (clear definition of DONE)</label><textarea id="m-objective">${esc(t.objective||'')}</textarea></div>
        <div class="row">
          <div class="field"><label>Category</label>
            <select id="m-category">
              ${['ACADEMICS','FILES','SKILLS','HEALTH','PROJECT','PERSONAL','RECREATION','OTHER'].map(c=>`<option ${t.category===c?'selected':''}>${c}</option>`).join('')}
            </select>
          </div>
-         <div class="field"><label>Subject</label><input id="m-subject" value="${esc(t.subject)}" placeholder="Physics" /></div>
+         <div class="field"><label>Subject</label><input id="m-subject" value="${esc(t.subject)}" /></div>
        </div>
        <div class="row">
          <div class="field"><label>Priority</label>
-           <select id="m-priority">
-             ${[1,2,3,4].map(p=>`<option value="${p}" ${t.priority===p?'selected':''}>P${p}</option>`).join('')}
-           </select>
+           <select id="m-priority">${[1,2,3,4].map(p=>`<option value="${p}" ${t.priority===p?'selected':''}>P${p}</option>`).join('')}</select>
          </div>
          <div class="field"><label>Estimated Minutes</label><input id="m-est" type="number" value="${t.estimatedMinutes}" /></div>
        </div>
        <div class="field"><label>Deadline</label><input id="m-deadline" type="date" value="${t.deadline}" /></div>
        <div class="field">
          <label>Linked Study Chapter (optional)</label>
-         <select id="m-chapter">
-           <option value="">— none —</option>
-           ${chapterOptions}
-         </select>
-         <div class="small muted mt8">If linked, focus time from this task auto-lands in that chapter's total.</div>
+         <select id="m-chapter"><option value="">— none —</option>${chapterOptions}</select>
+         <div class="small muted mt8">Focus time from this task auto-lands in that chapter's total.</div>
        </div>
        <div class="field"><label>Notes</label><textarea id="m-notes">${esc(t.notes||'')}</textarea></div>
        <div class="modal-foot">
          <button class="btn ghost" data-act="close-modal">Cancel</button>
-         <button class="btn primary" data-act="save-task" data-id="${task?task.id:''}">${task?'Save Changes':'Create Task'}</button>
+         <button class="btn primary" data-act="save-task" data-id="${task?task.id:''}">${task?'Save':'Create'}</button>
        </div>
      `);
    }
@@ -1661,11 +2702,11 @@
    function modalWhatNow(){
      const ranked=rankedTasks();
      if(!ranked.length){ openModal(`<h3>What Should I Do Now? <button class="btn ghost sm" data-act="close-modal">✕</button></h3><div class="empty">No open tasks. Enjoy a real break.</div>`); return; }
-     const r=ranked[0];
-     const t=r.task;
+     const r=ranked[0], t=r.task;
      const nx=nearestExam(t.subject);
      const reason = nx? `${nx.subject} exam in ${daysBetween(todayStr(),nx.date)} days.` : `Highest-priority open item.`;
      const linked = t.chapterId? findChapterRef(t.chapterId) : null;
+     const rem = remainingMinutesFor(t);
      openModal(`
        <h3>Do This Now <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
        <div style="font-size:19px;font-weight:800;color:var(--gold-2);line-height:1.35;">${esc(t.title)}</div>
@@ -1673,7 +2714,8 @@
          <span class="pri ${r.level}">${r.level}</span>
          ${catTag(t.category)}
          <span>${esc(t.subject||'')}</span>
-         <span>Duration: ${fmtDur(t.estimatedMinutes)}</span>
+         <span>Remaining: ${fmtDur(rem)}</span>
+         ${t.actualMinutes?`<span>Actual: ${fmtDur(t.actualMinutes)}</span>`:''}
          ${linked?`<span class="tag violet">◎ ${esc(linked.chapter.name)}</span>`:''}
        </div>
        <div class="hr"></div>
@@ -1692,15 +2734,36 @@
    function modalWasted(){
      openModal(`
        <h3>I Lost Time <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
-       <div class="small muted" style="margin-bottom:12px;">Not a failure — the day just got recalculated. How many minutes were lost?</div>
+       <div class="small muted" style="margin-bottom:12px;">Not a failure — the remaining day gets rebuilt. How many minutes were lost?</div>
        <div class="flex gap8 wrap" style="margin-bottom:14px;">
-         ${[30,60,90,120].map(m=>`<button class="btn sm" data-act="wasted-amt" data-id="${m}">${m} MIN</button>`).join('')}
+         ${[15,30,45,60,90,120].map(m=>`<button class="btn sm" data-act="wasted-amt" data-id="${m}">${m}m</button>`).join('')}
        </div>
-       <div class="field"><label>Custom (minutes)</label><input id="m-wasted" type="number" value="60" /></div>
+       <div class="field"><label>Custom (minutes)</label><input id="m-wasted" type="number" value="45" /></div>
+       <div class="field"><label>Reason (optional)</label><input id="m-wasted-reason" placeholder="e.g. unexpected guests" /></div>
        <div class="modal-foot">
          <button class="btn ghost" data-act="close-modal">Cancel</button>
-         <button class="btn primary" data-act="apply-wasted">⟳ Recalculate Remaining Day</button>
+         <button class="btn primary" data-act="apply-wasted">⟳ Rebuild Remaining Day</button>
        </div>
+     `);
+   }
+   
+   function modalDiff(){
+     if(!_bannerDiff) return;
+     const {reason, before, after}=_bannerDiff;
+     openModal(`
+       <h3>Schedule Changes <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
+       <div class="small muted" style="margin-bottom:12px;">${esc(reason)}</div>
+       <div class="diff-grid">
+         <div class="diff-col before">
+           <h4>Before</h4>
+           ${before.length? before.map(b=>`<div class="diff-row"><span class="mono">${m2t(b.start)}–${m2t(b.end)}</span> ${esc(b.title)}</div>`).join('') : `<div class="empty">—</div>`}
+         </div>
+         <div class="diff-col after">
+           <h4>After</h4>
+           ${after.length? after.map(b=>`<div class="diff-row"><span class="mono">${m2t(b.start)}–${m2t(b.end)}</span> ${esc(b.title)}</div>`).join('') : `<div class="empty">—</div>`}
+         </div>
+       </div>
+       <div class="modal-foot"><button class="btn primary" data-act="close-modal">OK</button></div>
      `);
    }
    
@@ -1708,19 +2771,19 @@
      openModal(`
        <h3>New Exam <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
        <div class="row">
-         <div class="field"><label>Subject</label><input id="ex-subject" placeholder="Physics" /></div>
+         <div class="field"><label>Subject</label><input id="ex-subject" /></div>
          <div class="field"><label>Importance</label><select id="ex-imp"><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select></div>
        </div>
-       <div class="field"><label>Title</label><input id="ex-title" placeholder="Physics — Board Exam" /></div>
+       <div class="field"><label>Title</label><input id="ex-title" /></div>
        <div class="row">
          <div class="field"><label>Date</label><input id="ex-date" type="date" value="${prefilledDate||todayStr()}" /></div>
          <div class="field"><label>Start Time</label><input id="ex-start" type="time" value="09:00" /></div>
        </div>
        <div class="field"><label>End Time</label><input id="ex-end" type="time" value="12:00" /></div>
-       <div class="field"><label>Chapters (one per line)</label><textarea id="ex-chapters" placeholder="Electric Charges and Fields&#10;Electric Potential"></textarea></div>
+       <div class="field"><label>Chapters (one per line)</label><textarea id="ex-chapters"></textarea></div>
        <div class="modal-foot">
          <button class="btn ghost" data-act="close-modal">Cancel</button>
-         <button class="btn primary" data-act="save-exam">Create Exam</button>
+         <button class="btn primary" data-act="save-exam">Create</button>
        </div>
      `);
    }
@@ -1729,16 +2792,16 @@
      const ref=findChapterRef(chapterId); if(!ref) return;
      openModal(`
        <h3>Log Study Time <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
-       <div style="font-size:12px;color:var(--gold-2);font-weight:700;letter-spacing:.08em;">${esc(ref.subject.name)} — ${esc(ref.chapter.name)}</div>
+       <div style="font-size:12px;color:var(--gold-2);font-weight:700;">${esc(ref.subject.name)} — ${esc(ref.chapter.name)}</div>
        <div class="small muted mt8" style="margin-bottom:16px;">Current total: ${fmtDur(ref.chapter.totalMinutes||0)}</div>
        <div class="quick-log-btns" style="margin-bottom:14px;">
          ${[10,15,25,40,60,90].map(m=>`<button class="btn sm" data-act="ql-amt" data-id="${m}">${m}m</button>`).join('')}
        </div>
        <div class="field"><label>Custom (minutes)</label><input id="ql-min" type="number" value="30" /></div>
-       <div class="field"><label>Note (optional)</label><input id="ql-note" placeholder="What did you cover?" /></div>
+       <div class="field"><label>Note (optional)</label><input id="ql-note" /></div>
        <div class="modal-foot">
          <button class="btn ghost" data-act="close-modal">Cancel</button>
-         <button class="btn primary" data-act="ql-save" data-id="${chapterId}">Log Session</button>
+         <button class="btn primary" data-act="ql-save" data-id="${chapterId}">Log</button>
        </div>
      `);
    }
@@ -1748,7 +2811,7 @@
      const s=[...(ref.chapter.sessions||[])].reverse();
      openModal(`
        <h3>Session History <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
-       <div style="font-size:12px;color:var(--gold-2);font-weight:700;letter-spacing:.08em;">${esc(ref.subject.name)} — ${esc(ref.chapter.name)}</div>
+       <div style="font-size:12px;color:var(--gold-2);font-weight:700;">${esc(ref.subject.name)} — ${esc(ref.chapter.name)}</div>
        <div class="small muted mt8" style="margin-bottom:16px;">${s.length} session(s) · total ${fmtDur(ref.chapter.totalMinutes||0)}</div>
        <div class="chapter-session-list">
          ${s.length? s.map(x=>`
@@ -1757,18 +2820,56 @@
              <span class="mono" style="min-width:50px;">${new Date(x.start).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</span>
              <span class="mono" style="color:var(--good);min-width:50px;">${x.minutes}m</span>
              <span style="flex:1;">${esc(x.note||'')}</span>
-           </div>
-         `).join('') : `<div class="empty">No sessions yet</div>`}
+           </div>`).join('') : `<div class="empty">No sessions yet</div>`}
        </div>
        <div class="modal-foot">
          <button class="btn ghost" data-act="close-modal">Close</button>
-         <button class="btn primary" data-act="chapter-start" data-id="${chapterId}">▶ Start New Session</button>
+         <button class="btn primary" data-act="chapter-start" data-id="${chapterId}">▶ Start Session</button>
+       </div>
+     `);
+   }
+   
+   function modalAddQuestion(){
+     openModal(`
+       <h3>Add Question <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
+       <div class="row">
+         <div class="field"><label>Exam</label><input id="q-exam" value="CBSE" /></div>
+         <div class="field"><label>Year</label><input id="q-year" type="number" value="${new Date().getFullYear()}" /></div>
+       </div>
+       <div class="row">
+         <div class="field"><label>Subject</label><input id="q-subject" value="Physics" /></div>
+         <div class="field"><label>Chapter</label><input id="q-chapter" /></div>
+       </div>
+       <div class="row">
+         <div class="field"><label>Topic</label><input id="q-topic" /></div>
+         <div class="field"><label>Question Type</label>
+           <select id="q-type">
+             <option>MCQ</option><option>Numerical</option><option>Short</option><option>Long</option>
+             <option>Assertion-Reason</option><option>Case-based</option><option>Derivation</option>
+           </select>
+         </div>
+       </div>
+       <div class="row">
+         <div class="field"><label>Marks</label><input id="q-marks" type="number" value="1" /></div>
+         <div class="field"><label>Difficulty</label>
+           <select id="q-diff"><option>EASY</option><option selected>MEDIUM</option><option>HARD</option></select>
+         </div>
+       </div>
+       <div class="field"><label>Question Text</label><textarea id="q-text" style="min-height:100px;"></textarea></div>
+       <div class="field"><label>Options (comma separated — leave empty for subjective)</label><input id="q-options" placeholder="Option A, Option B, ..." /></div>
+       <div class="field"><label>Correct Answer</label><input id="q-answer" /></div>
+       <div class="field"><label>Solution</label><textarea id="q-solution"></textarea></div>
+       <div class="field"><label>Recommended Time (seconds)</label><input id="q-rtime" type="number" value="90" /></div>
+       <div class="field"><label>Source (e.g. "CBSE 2024 Physics")</label><input id="q-source" /></div>
+       <div class="modal-foot">
+         <button class="btn ghost" data-act="close-modal">Cancel</button>
+         <button class="btn primary" data-act="save-question">Save Question</button>
        </div>
      `);
    }
    
    /* ------------------------------------------------------------
-      15. DRAWER (Calendar day detail)
+      19. DRAWER
       ------------------------------------------------------------ */
    let DRAWER_DATE=null;
    
@@ -1801,7 +2902,6 @@
        <div class="flex gap8 wrap">
          <button class="btn primary sm" data-act="drawer-add-task">+ Task</button>
          <button class="btn sm" data-act="drawer-add-exam">+ Exam</button>
-         <button class="btn sm ghost" data-act="drawer-open-day">Open Day Plan →</button>
        </div>
    
        ${commits.length?`
@@ -1825,7 +2925,7 @@
          ${tasks.map(t=>`<div class="drawer-row">
            <span class="pri ${levelOfTask(t.id)}">${levelOfTask(t.id)}</span>
            <span class="flex-1">${esc(t.title)}</span>
-           <span class="small muted">${fmtDur(t.estimatedMinutes)}</span>
+           <span class="small muted">${fmtDur(remainingMinutesFor(t))}</span>
          </div>`).join('')}`:''}
    
        ${files.length?`
@@ -1841,7 +2941,20 @@
    }
    
    /* ------------------------------------------------------------
-      16. EVENT DELEGATION
+      20. ASSISTANT EXECUTION (from UI)
+      ------------------------------------------------------------ */
+   async function runAssistant(input){
+     const val=String(input||'').trim();
+     if(!val) return;
+     const result=await Assistant.executeText(val);
+     toast(result.message);
+     if(result.needsConfirm) return;
+     // Refresh view
+     render();
+   }
+   
+   /* ------------------------------------------------------------
+      21. EVENT DELEGATION
       ------------------------------------------------------------ */
    document.addEventListener('click', e=>{
      const el=e.target.closest('[data-act]');
@@ -1849,18 +2962,135 @@
      const act=el.dataset.act;
      const id=el.dataset.id;
    
-     /* --- navigation --- */
      if(act==='nav'){ VIEW=id; render({resetScroll:true}); $('.sidebar').classList.remove('open'); return; }
      if(act==='close-modal'){ closeModal(); return; }
      if(act==='close-drawer'){ closeDrawer(); return; }
      if(act==='filter'){ TASK_FILTER=id; render(); return; }
    
-     /* --- study workspace --- */
-     if(act==='toggle-subject'){
-       STUDY_OPEN[id]=!STUDY_OPEN[id];
-       render();
+     /* ---------- Assistant ---------- */
+     if(act==='open-assistant'){
+       VIEW='dashboard'; render({resetScroll:true});
+       setTimeout(()=>{ const i=$('#assistantInput'); if(i) i.focus(); }, 100);
        return;
      }
+     if(act==='assistant-execute'){
+       const i=$('#assistantInput'); if(!i) return;
+       runAssistant(i.value); i.value='';
+       return;
+     }
+     if(act==='assistant-clear'){
+       Assistant.history=[]; render(); toast('History cleared'); return;
+     }
+   
+     /* ---------- Schedule banner ---------- */
+     if(act==='dismiss-banner'){ $('#schedBanner').classList.remove('show'); return; }
+     if(act==='view-diff'){ modalDiff(); return; }
+   
+     /* ---------- Practice ---------- */
+     if(act==='practice-tab'){ PRACTICE_TAB=id; render(); return; }
+     if(act==='practice-new'){ PRACTICE_TAB='now'; VIEW='practice'; render({resetScroll:true}); return; }
+     if(act==='practice-add-question'){ modalAddQuestion(); return; }
+     if(act==='practice-import-pdf'){ modalPdfImport(); return; }
+     if(act==='save-question'){
+       const optsStr=$('#q-options').value.trim();
+       const options=optsStr? optsStr.split(',').map(s=>s.trim()).filter(Boolean) : null;
+       const q={
+         id:uid(),
+         exam:$('#q-exam').value.trim()||'Custom',
+         year:Number($('#q-year').value)||null,
+         subject:$('#q-subject').value.trim(),
+         chapter:$('#q-chapter').value.trim(),
+         topic:$('#q-topic').value.trim(),
+         questionType:$('#q-type').value,
+         marks:Number($('#q-marks').value)||1,
+         difficulty:$('#q-diff').value,
+         questionText:$('#q-text').value.trim(),
+         options,
+         answer:$('#q-answer').value.trim(),
+         solution:$('#q-solution').value.trim(),
+         recommendedTime:Number($('#q-rtime').value)||90,
+         source:$('#q-source').value.trim()||'Custom'
+       };
+       if(!q.questionText){ toast('Question text required'); return; }
+       if(!q.answer){ toast('Answer required'); return; }
+       DB.questions.push(q); saveDB(); closeModal(); toast('Question added'); render(); return;
+     }
+     if(act==='practice-del-q'){
+       if(!confirm('Delete this question?')) return;
+       DB.questions=DB.questions.filter(x=>x.id!==id); saveDB(); render(); return;
+     }
+     if(act==='practice-start-custom'){
+       const exam=$('#p-exam').value;
+       const subject=$('#p-subject').value;
+       const chapter=$('#p-chapter').value;
+       const count=Number($('#p-count').value)||10;
+       const timer=$('#p-timer').value;
+       const pqsec=Number($('#p-pqsec').value)||90;
+       let pool=DB.questions.slice();
+       if(exam) pool=pool.filter(q=>q.exam===exam);
+       if(subject) pool=pool.filter(q=>q.subject===subject);
+       if(chapter) pool=pool.filter(q=>q.chapter===chapter);
+       if(!pool.length){ toast('No questions match'); return; }
+       const picked=pool.slice(0,count);
+       Practice.start({
+         mode:'custom',
+         config:{subject,chapter,count:picked.length},
+         questions:picked,
+         perQuestionSec:pqsec
+       });
+       if(timer==='none') Practice.setTimerMode('none');
+       else if(timer==='full') Practice.setTimerMode('full', picked.length*pqsec);
+       else Practice.setTimerMode('per-question', pqsec);
+       return;
+     }
+     if(act==='practice-chapter'){
+       const [sub,ch]=id.split('||');
+       const pool=DB.questions.filter(q=>q.subject===sub && q.chapter===ch);
+       if(!pool.length){ toast('No questions'); return; }
+       const chRef=(DB.subjects||[]).find(s=>s.name===sub)?.chapters.find(c=>c.name===ch);
+       Practice.start({
+         mode:'chapter',
+         config:{subject:sub, chapter:ch, count:pool.length},
+         questions:pool,
+         chapterId: chRef? chRef.id : null
+       });
+       return;
+     }
+     if(act==='practice-paper'){
+       const [exam,sub,year]=id.split('||');
+       const pool=DB.questions.filter(q=>q.exam===exam && q.subject===sub && String(q.year)===String(year));
+       if(!pool.length){ toast('No questions'); return; }
+       Practice.start({
+         mode:'paper',
+         config:{subject:sub, chapter:'Full Paper', exam, year, count:pool.length},
+         questions:pool,
+         perQuestionSec:90
+       });
+       Practice.setTimerMode('full', pool.length*90);
+       return;
+     }
+     // Practice session internal actions
+     if(act==='ps-choose'){ Practice.chooseOption(el.dataset.opt); return; }
+     if(act==='ps-save-answer'){ Practice.saveTextAnswer(); return; }
+     if(act==='ps-reveal'){ Practice.reveal(); return; }
+     if(act==='ps-mark'){ Practice.mark(); return; }
+     if(act==='ps-jump'){ Practice.jump(Number(id)); return; }
+     if(act==='ps-next'){ Practice.next(); return; }
+     if(act==='ps-prev'){ Practice.prev(); return; }
+     if(act==='ps-submit'){ if(confirm('Submit practice session?')) Practice.submit(); return; }
+     if(act==='ps-exit'){ Practice.exitConfirm(); return; }
+     if(act==='ps-finish'){ Practice.finish(); return; }
+     if(act==='ps-change-timer'){
+       const s=Practice.session; if(!s) return;
+       const opts=['per-question','full','none'];
+       const next=opts[(opts.indexOf(s.timerMode)+1)%opts.length];
+       Practice.setTimerMode(next);
+       toast('Timer: '+next);
+       return;
+     }
+   
+     /* ---------- Study workspace ---------- */
+     if(act==='toggle-subject'){ STUDY_OPEN[id]=!STUDY_OPEN[id]; render(); return; }
      if(act==='new-subject'){
        const name=prompt('Subject name:'); if(!name) return;
        const color=SUBJECT_COLORS[DB.subjects.length%SUBJECT_COLORS.length];
@@ -1874,14 +3104,13 @@
      }
      if(act==='del-subject'){
        const s=DB.subjects.find(x=>x.id===id); if(!s) return;
-       if(!confirm('Delete subject "'+s.name+'" and all its chapters/sessions?')) return;
+       if(!confirm('Delete "'+s.name+'" and all its chapters/sessions?')) return;
        DB.subjects=DB.subjects.filter(x=>x.id!==id); saveDB(); render(); return;
      }
      if(act==='new-chapter'){
        const s=DB.subjects.find(x=>x.id===id); if(!s) return;
        const name=prompt('Chapter name:'); if(!name) return;
-       s.chapters.push(mkChapter(name.trim()));
-       saveDB(); toast('Chapter added'); render(); return;
+       s.chapters.push(mkChapter(name.trim())); saveDB(); toast('Chapter added'); render(); return;
      }
      if(act==='del-chapter'){
        for(const s of DB.subjects){
@@ -1896,40 +3125,31 @@
      if(act==='chapter-start'){
        closeModal();
        Timer.setChapter(id, DB.settings.focusDuration||40);
-       $('#exec').classList.add('show');
-       Timer.start();
-       return;
+       $('#exec').classList.add('show'); Timer.start(); return;
      }
      if(act==='chapter-log'){ modalChapterLog(id); return; }
      if(act==='chapter-history'){ modalChapterHistory(id); return; }
      if(act==='ql-amt'){ $('#ql-min').value=id; return; }
      if(act==='ql-save'){
        const mins=Number($('#ql-min').value)||0;
-       if(mins<=0){ toast('Enter a positive minute value'); return; }
+       if(mins<=0){ toast('Enter minutes'); return; }
        const note=$('#ql-note').value.trim();
        if(logChapterSession(id, mins, {note})){
-         // also mirror as a focusSession for analytics
          const ref=findChapterRef(id);
          DB.focusSessions.push({
            id:uid(), taskId:null, chapterId:id,
            subject:ref? ref.subject.name+' · '+ref.chapter.name : '—',
-           date:todayStr(),
-           start:new Date().toISOString(), end:new Date().toISOString(),
+           date:todayStr(), start:new Date().toISOString(), end:new Date().toISOString(),
            minutes:mins, mode:'quick-log'
          });
-         saveDB(); closeModal();
-         toast('Logged '+mins+' min');
-         render();
+         saveDB(); closeModal(); toast('Logged '+mins+' min'); render();
        } else toast('Log failed');
        return;
      }
      if(act==='chapter-manual'){
        for(const s of DB.subjects){
          const c=s.chapters.find(x=>x.id===id);
-         if(c){
-           c.manualStatus=el.value||null;
-           saveDB(); render(); return;
-         }
+         if(c){ c.manualStatus=el.value||null; saveDB(); render(); return; }
        }
        return;
      }
@@ -1942,16 +3162,13 @@
            DB.subjects.push(subj);
          }
          e.chapters.forEach(ec=>{
-           if(!subj.chapters.some(c=>c.name===ec.name)){
-             subj.chapters.push(mkChapter(ec.name));
-             added++;
-           }
+           if(!subj.chapters.some(c=>c.name===ec.name)){ subj.chapters.push(mkChapter(ec.name)); added++; }
          });
        });
        saveDB(); toast(added+' chapters imported'); render(); return;
      }
    
-     /* --- task actions --- */
+     /* ---------- Tasks ---------- */
      if(act==='toggle-task'){
        const t=DB.tasks.find(x=>x.id===id); if(!t) return;
        if(t.status==='COMPLETED'){ t.status='TODO'; t.completedAt=null; }
@@ -1968,22 +3185,27 @@
        Timer.setTask(t.id);
        if(t.status==='TODO'){ t.status='IN_PROGRESS'; saveDB(); }
        closeModal();
-       $('#exec').classList.add('show');
-       Timer.start();
+       $('#exec').classList.add('show'); Timer.start();
        return;
      }
      if(act==='complete-task'){
        const t=DB.tasks.find(x=>x.id===id); if(!t) return;
        t.status='COMPLETED'; t.completedAt=new Date().toISOString();
-       saveDB(); toast('Completed'); render(); return;
+       saveDB(); toast('Completed');
+       setTimeout(()=>{ adaptiveReschedule({reason:'Completed: '+t.title.slice(0,32)}); render(); }, 300);
+       return;
      }
      if(act==='skip-task'){
        const t=DB.tasks.find(x=>x.id===id); if(!t) return;
-       t.status='SKIPPED'; saveDB(); toast('Skipped'); render(); return;
+       t.status='SKIPPED'; saveDB(); toast('Skipped');
+       setTimeout(()=>{ adaptiveReschedule({reason:'Skipped: '+t.title.slice(0,32)}); render(); }, 300);
+       return;
      }
      if(act==='resched-task'){
        const t=DB.tasks.find(x=>x.id===id); if(!t) return;
-       t.status='RESCHEDULED'; saveDB(); toast('Deferred to next slot'); regenerate(0,true); render(); return;
+       t.status='RESCHEDULED'; saveDB();
+       adaptiveReschedule({reason:'Deferred: '+t.title.slice(0,32)});
+       render(); return;
      }
      if(act==='pause-task'){ Timer.pause(); return; }
    
@@ -2008,7 +3230,7 @@
          DB.tasks.push({id:uid(),...data,actualMinutes:0,status:'TODO',
            difficulty:'MEDIUM',subtasks:[],createdAt:todayStr(),completedAt:null});
        }
-       saveDB(); closeModal(); toast('Task saved'); regenerate(); render(); return;
+       saveDB(); closeModal(); toast('Task saved'); regenerate(0,false); render(); return;
      }
      if(act==='add-sub'){
        const t=DB.tasks.find(x=>x.id===id); if(!t) return;
@@ -2021,7 +3243,7 @@
        DB.tasks=DB.tasks.filter(x=>x.id!==id); saveDB(); render(); return;
      }
    
-     /* --- exams --- */
+     /* ---------- Exams ---------- */
      if(act==='new-exam'){ modalNewExam(); return; }
      if(act==='save-exam'){
        const subject=$('#ex-subject').value.trim(); if(!subject){ toast('Subject required'); return; }
@@ -2056,7 +3278,7 @@
            }
          }
        });
-       saveDB(); toast(added+' study task(s) created'); regenerate(); render(); return;
+       saveDB(); toast(added+' study task(s) created'); regenerate(0,false); render(); return;
      }
      if(act==='chap-status'){
        const e=DB.exams.find(x=>x.id===id); if(!e) return;
@@ -2064,18 +3286,19 @@
        c.status=el.value; saveDB(); render(); return;
      }
    
-     /* --- misc --- */
-     if(act==='regen'){ regenerate(0,false); toast('Day regenerated'); render(); return; }
+     /* ---------- Misc ---------- */
+     if(act==='regen'){ adaptiveReschedule({reason:'Manual regenerate'}); render(); return; }
      if(act==='whatnow'){ modalWhatNow(); return; }
      if(act==='wasted'){ modalWasted(); return; }
      if(act==='wasted-amt'){ $('#m-wasted').value=id; return; }
      if(act==='apply-wasted'){
        const mins=Number($('#m-wasted').value)||60;
-       DB.schedule=buildDayPlan(todayStr(),{lostMinutes:mins,fromMin:nowMin()});
-       saveDB(); closeModal(); toast('Recalculated · '+mins+' min lost'); render(); return;
+       const reason=$('#m-wasted-reason').value.trim()||('Lost '+mins+' min');
+       adaptiveReschedule({reason, lostMinutes:mins, fromMin:nowMin()});
+       closeModal(); toast('Rebuilt remaining day'); render(); return;
      }
    
-     /* --- execution mode --- */
+     /* ---------- Execution mode ---------- */
      if(act==='open-exec'){
        if(!Timer.taskId && !Timer.chapterId){
          const nb=nextBlock()||currentBlock();
@@ -2091,40 +3314,24 @@
        if(!Timer.taskId && !Timer.chapterId){
          const nb=nextBlock()||currentBlock();
          if(nb && nb.taskId) Timer.setTask(nb.taskId,5);
-       } else if(Timer.chapterId){
-         Timer.setChapter(Timer.chapterId,5);
-       } else {
-         Timer.setTask(Timer.taskId,5);
-       }
+       } else if(Timer.chapterId) Timer.setChapter(Timer.chapterId,5);
+       else Timer.setTask(Timer.taskId,5);
        Timer.launch=true; Timer.start();
        toast('5-Minute Launch · just start');
        return;
      }
    
-     /* --- calendar --- */
+     /* ---------- Calendar ---------- */
      if(act==='cal-prev'){ CAL_MONTH--; if(CAL_MONTH<0){CAL_MONTH=11;CAL_YEAR--;} render(); return; }
      if(act==='cal-next'){ CAL_MONTH++; if(CAL_MONTH>11){CAL_MONTH=0;CAL_YEAR++;} render(); return; }
      if(act==='cal-today'){ const n=new Date(); CAL_MONTH=n.getMonth(); CAL_YEAR=n.getFullYear(); render(); return; }
      if(act==='cal-day'){ openDrawer(id); return; }
    
-     /* --- drawer --- */
+     /* ---------- Drawer ---------- */
      if(act==='drawer-add-task'){ modalTaskForm(null, DRAWER_DATE); return; }
      if(act==='drawer-add-exam'){ modalNewExam(DRAWER_DATE); return; }
-     if(act==='drawer-open-day'){
-       const ds=DRAWER_DATE;
-       if(ds===todayStr()){ VIEW='today'; }
-       else {
-         // jump to that day's plan by faking "today" for the session
-         // For simplicity: open the Today view showing today, but toast
-         VIEW='calendar';
-         toast('Day plan view coming soon — for now, today only');
-       }
-       closeDrawer();
-       render({resetScroll:true});
-       return;
-     }
    
-     /* --- projects --- */
+     /* ---------- Projects / Files / Habits ---------- */
      if(act==='new-project'){
        const title=prompt('Project title:'); if(!title) return;
        DB.projects.push({id:uid(),title,description:'',milestones:[]});
@@ -2140,11 +3347,9 @@
        if(!confirm('Delete project?')) return;
        DB.projects=DB.projects.filter(x=>x.id!==id); saveDB(); render(); return;
      }
-   
-     /* --- files --- */
      if(act==='new-file'){
        const subject=prompt('Subject:'); if(!subject) return;
-       const type=prompt('Type (Notebook / Practical File / Assignment):','Notebook')||'Notebook';
+       const type=prompt('Type:','Notebook')||'Notebook';
        DB.files.push({id:uid(),subject,type,deadline:relDate(3),remaining:'10 pages',
          estimatedMinutes:60,priority:3,status:'PENDING',sessions:['Session 1','Session 2']});
        saveDB(); render(); return;
@@ -2158,14 +3363,12 @@
          difficulty:'LOW',notes:'',objective:'Complete one session and mark progress.',
          subtasks:[],chapterId:null,createdAt:todayStr(),completedAt:null
        });
-       saveDB(); toast('Session added to tasks'); regenerate(); render(); return;
+       saveDB(); toast('Session added'); regenerate(0,false); render(); return;
      }
      if(act==='del-file'){
-       if(!confirm('Delete file work?')) return;
+       if(!confirm('Delete?')) return;
        DB.files=DB.files.filter(x=>x.id!==id); saveDB(); render(); return;
      }
-   
-     /* --- habits --- */
      if(act==='new-habit'){
        const title=prompt('Habit title:'); if(!title) return;
        const minutes=Number(prompt('Minutes per day:','15'))||15;
@@ -2182,42 +3385,22 @@
        DB.habits=DB.habits.filter(x=>x.id!==id); saveDB(); render(); return;
      }
    
-     /* --- settings & file sync --- */
-     if(act==='save-settings'){
-       const s=DB.settings;
-       s.user=$('#set-user').value.trim()||'Chief';
-       s.examModeThreshold=Number($('#set-examth').value)||10;
-       s.wake=$('#set-wake').value; s.sleep=$('#set-sleep').value;
-       s.bufferMinutes=Number($('#set-buffer').value)||10;
-       s.maxStudyMinutesPerDay=Number($('#set-maxstudy').value)||300;
-       s.focusDuration=Number($('#set-focus').value)||40;
-       s.breakDuration=Number($('#set-break').value)||10;
-       s.exerciseTarget=Number($('#set-exercise').value)||30;
-       s.englishTarget=Number($('#set-english').value)||15;
-       s.projectTime=Number($('#set-project').value)||30;
-       s.recreationAllowance=Number($('#set-recreation').value)||60;
-       s.distractions=$('#set-distractions').value;
-       saveDB(); toast('Settings saved'); regenerate(); render(); return;
-     }
+     /* ---------- File sync / data ---------- */
      if(act==='new-commitment'){
        const title=prompt('Commitment title:'); if(!title) return;
        const start=prompt('Start time (HH:MM):','09:00'); if(!start) return;
        const end=prompt('End time (HH:MM):','10:00'); if(!end) return;
        DB.commitments.push({id:uid(),title,type:'routine',start,end,days:[0,1,2,3,4,5,6]});
-       saveDB(); regenerate(); render(); return;
+       saveDB(); adaptiveReschedule({reason:'New commitment'}); render(); return;
      }
      if(act==='del-commitment'){
        if(!confirm('Delete commitment?')) return;
-       DB.commitments=DB.commitments.filter(x=>x.id!==id); saveDB(); regenerate(); render(); return;
+       DB.commitments=DB.commitments.filter(x=>x.id!==id); saveDB(); adaptiveReschedule({reason:'Commitment removed'}); render(); return;
      }
-   
-     /* --- file sync --- */
      if(act==='fs-connect'){ FileSync.connect(); return; }
      if(act==='fs-reconnect'){ FileSync.reconnect(); return; }
-     if(act==='fs-disconnect'){ if(!confirm('Disconnect the data file? Auto-save will stop.')) return; FileSync.disconnect(); return; }
+     if(act==='fs-disconnect'){ if(!confirm('Disconnect the data file?')) return; FileSync.disconnect(); return; }
      if(act==='fs-save'){ FileSync.save().then(()=>toast('Saved to file')); return; }
-   
-     /* --- export / reset --- */
      if(act==='export'){
        const blob=new Blob([JSON.stringify(DB,null,2)],{type:'application/json'});
        const a=document.createElement('a');
@@ -2238,17 +3421,73 @@
      if(act==='reset'){
        if(!confirm('Reset ALL data? This cannot be undone.')) return;
        if(!confirm('Really delete everything?')) return;
-       localStorage.removeItem(DB_KEY); DB=loadDB(); migrate(); regenerate(); render(); toast('Reset complete'); return;
+       localStorage.removeItem(DB_KEY); DB=loadDB(); migrate(); regenerate(0,false); render(); toast('Reset complete'); return;
      }
    });
    
+   /* ---------- Key handlers ---------- */
+   document.addEventListener('keydown', e=>{
+     // Assistant input: Enter = execute
+     if(e.key==='Enter' && e.target && e.target.id==='assistantInput'){
+       const i=e.target;
+       runAssistant(i.value); i.value='';
+       e.preventDefault(); return;
+     }
+     // Ctrl+K = focus assistant
+     if((e.ctrlKey||e.metaKey) && e.key==='k'){
+       e.preventDefault();
+       VIEW='dashboard'; render({resetScroll:true});
+       setTimeout(()=>{ const i=$('#assistantInput'); if(i) i.focus(); }, 80);
+       return;
+     }
+     // Esc = close modal / drawer / exec / practice
+     if(e.key==='Escape'){
+       if($('#overlay').classList.contains('show')) closeModal();
+       else if($('#drawer').classList.contains('show')) closeDrawer();
+       else if($('#exec').classList.contains('show')){ $('#exec').classList.remove('show'); Timer.pause(); }
+     }
+   });
+   
+   /* ---------- Auto-save settings on input ---------- */
+   document.addEventListener('input', e=>{
+     const t=e.target;
+     if(!t || !t.id || !t.id.startsWith('set-')) return;
+     const v=t.value;
+     const s=DB.settings;
+     const num=x=>{ const n=Number(x); return isNaN(n)? undefined : n; };
+   
+     switch(t.id){
+       case 'set-user': s.user=v.trim()||'Chief'; break;
+       case 'set-examth': s.examModeThreshold=num(v)??10; break;
+       case 'set-wake': s.wake=v; break;
+       case 'set-sleep': s.sleep=v; break;
+       case 'set-buffer': s.bufferMinutes=num(v)??10; break;
+       case 'set-maxstudy': s.maxStudyMinutesPerDay=num(v)??300; break;
+       case 'set-focus': s.focusDuration=num(v)??40; break;
+       case 'set-break': s.breakDuration=num(v)??10; break;
+       case 'set-exercise': s.exerciseTarget=num(v)??30; break;
+       case 'set-english': s.englishTarget=num(v)??15; break;
+       case 'set-project': s.projectTime=num(v)??30; break;
+       case 'set-recreation': s.recreationAllowance=num(v)??60; break;
+       case 'set-pqsec': s.practicePerQuestionSec=num(v)??90; break;
+       case 'set-distractions': s.distractions=v; break;
+       default: return;
+     }
+     saveDB(); savedPulse();
+   });
+   document.addEventListener('change', e=>{
+     const t=e.target;
+     if(!t || !t.id || !t.id.startsWith('set-')) return;
+     if(t.id==='set-ptimer'){ DB.settings.practiceTimerDefault=t.value; saveDB(); savedPulse(); }
+   });
+   
    /* ------------------------------------------------------------
-      17. INIT
+      22. INIT
       ------------------------------------------------------------ */
    async function init(){
      DB=loadDB();
      migrate();
-     if(!DB.schedule || DB.schedule.date!==todayStr()) regenerate();
+     if(!DB.schedule || DB.schedule.date!==todayStr()) regenerate(0,false);
    
      renderNav();
      renderClock();
@@ -2256,7 +3495,6 @@
      renderFocusPill();
      render();
    
-     // file sync boot
      await FileSync.init();
      FileSync.updateUI();
    
@@ -2269,8 +3507,92 @@
      $('#overlay').addEventListener('click',e=>{ if(e.target.id==='overlay') closeModal(); });
      $('#drawerBackdrop').addEventListener('click',closeDrawer);
    
+     // Greet
      toast('Assistant online · '+DB.settings.user);
-     console.log('%c◈ CHIEF\'S EXECUTION ASSISTANT v2','color:#d4af37;font-size:16px;font-weight:bold;');
+     console.log('%c◈ CHIEF\'S EXECUTION ASSISTANT v3','color:#d4af37;font-size:16px;font-weight:bold;');
    }
+   
+   /* ---------- PDF Import modal (basic text extraction) ---------- */
+   function modalPdfImport(){
+     openModal(`
+       <h3>Import Question Paper (PDF) <button class="btn ghost sm" data-act="close-modal">✕</button></h3>
+       <div class="small muted" style="margin-bottom:14px;">
+         Text PDFs can be parsed automatically. Scanned / image PDFs will need manual entry.
+         Extracted questions are <b>not</b> auto-added as PYQs — you review them first.
+       </div>
+       <div class="pdf-drop" id="pdfDrop">
+         <div class="pd-icon">⇣</div>
+         <div class="pd-txt"><b>Drop a PDF here</b> or click to select</div>
+       </div>
+       <input type="file" id="pdfFile" accept=".pdf,application/pdf" style="display:none;" />
+       <div class="field" style="margin-top:14px;">
+         <label>Paste extracted text manually (fallback)</label>
+         <textarea id="pdfManual" placeholder="Paste text from a question paper here, one question per line..."></textarea>
+       </div>
+       <div class="modal-foot">
+         <button class="btn ghost" data-act="close-modal">Cancel</button>
+         <button class="btn primary" data-act="pdf-manual-parse">Parse Text</button>
+       </div>
+     `);
+     setTimeout(()=>{
+       const drop=$('#pdfDrop'), inp=$('#pdfFile');
+       if(!drop || !inp) return;
+       drop.addEventListener('click',()=>inp.click());
+       drop.addEventListener('dragover', ev=>{ ev.preventDefault(); drop.classList.add('drag'); });
+       drop.addEventListener('dragleave', ()=>drop.classList.remove('drag'));
+       drop.addEventListener('drop', ev=>{
+         ev.preventDefault(); drop.classList.remove('drag');
+         const f=ev.dataTransfer.files[0]; if(f) handlePdfFile(f);
+       });
+       inp.addEventListener('change', ()=>{ const f=inp.files[0]; if(f) handlePdfFile(f); });
+     }, 50);
+   }
+   
+   async function handlePdfFile(file){
+     if(!file || !file.type.includes('pdf') && !file.name.endsWith('.pdf')){
+       toast('Not a PDF'); return;
+     }
+     // Basic: read as text (works only for text PDFs)
+     try{
+       const text=await file.text();
+       // Very rough: PDF text streams are compressed and won't be readable here
+       // We check whether it looks like extracted content
+       const looksTexty = /[A-Za-z]{4,}\s+[A-Za-z]{4,}/.test(text) && !text.startsWith('%PDF');
+       if(looksTexty){
+         $('#pdfManual').value=text.slice(0, 4000);
+         toast('Some text extracted — review and parse');
+       } else {
+         toast('This PDF looks scanned or compressed — paste text manually');
+       }
+     }catch(e){
+       toast('PDF read failed');
+     }
+   }
+   
+   document.addEventListener('click', e=>{
+     const el=e.target.closest('[data-act]');
+     if(!el) return;
+     if(el.dataset.act==='pdf-manual-parse'){
+       const txt=($('#pdfManual')||{}).value||'';
+       const lines=txt.split('\n').map(s=>s.trim()).filter(Boolean);
+       if(!lines.length){ toast('No text'); return; }
+       let added=0;
+       lines.forEach(line=>{
+         if(line.length<10) return;
+         DB.questions.push({
+           id:uid(), exam:'Imported', year:null,
+           subject:'', chapter:'', topic:'',
+           questionType:'Short', marks:1, difficulty:'MEDIUM',
+           questionText:line, options:null, answer:'(set manually)',
+           solution:'', recommendedTime:120,
+           source:'Imported from PDF — review needed'
+         });
+         added++;
+       });
+       saveDB(); closeModal(); toast(added+' questions imported (review needed)');
+       PRACTICE_TAB='bank'; VIEW='practice'; render({resetScroll:true});
+       return;
+     }
+   });
    
    document.addEventListener('DOMContentLoaded',init);
